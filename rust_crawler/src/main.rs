@@ -100,6 +100,8 @@ struct CrawlerApp {
     mute_same_kind: bool,
     /// 启动后只做一次网络探测。
     did_net_probe: bool,
+    /// 启动后把本机上次发库编号补写到 bot 简介一次。
+    did_tg_resync: bool,
     /// 联网方式：0自动 1强制直连 2走系统代理
     net_mode: usize,
     /// 联网方式说明弹窗。
@@ -148,6 +150,7 @@ impl Default for CrawlerApp {
             did_maximize: false,
             mute_same_kind: false,
             did_net_probe: false,
+            did_tg_resync: false,
             net_mode: crate::http::current_proxy_mode().as_index(),
             show_net_help: false,
             tg_token: crate::telegram::load().bot_token,
@@ -764,6 +767,17 @@ impl App for CrawlerApp {
             self.did_net_probe = true;
             spawn_startup_probe(self.state.clone());
         }
+        if !self.did_tg_resync {
+            self.did_tg_resync = true;
+            let state = self.state.clone();
+            thread::spawn(move || {
+                crate::telegram::resync_published_file_id(&|s| {
+                    if let Ok(mut g) = state.lock() {
+                        g.push_log(s.to_string());
+                    }
+                });
+            });
+        }
         if self.tg_thread.as_ref().map(|h| h.is_finished()).unwrap_or(false) {
             if let Some(h) = self.tg_thread.take() {
                 let _ = h.join();
@@ -1051,8 +1065,8 @@ impl App for CrawlerApp {
                                     self.show_tg_help = true;
                                 }
                                 if ui
-                                    .add_enabled(!tg_busy, egui::Button::new(if tg_busy {
-                                        "正在发送…"
+                                    .add_enabled(!tg_busy && !is_busy, egui::Button::new(if tg_busy {
+                                        "正在处理…"
                                     } else {
                                         "发送数据库"
                                     }))
@@ -1135,7 +1149,7 @@ impl App for CrawlerApp {
                             });
                             ui.colored_label(
                                 DIM,
-                                "另一台电脑：先把压缩包转发给 bot，再下载；然后保持「继续」开始抓取。",
+                                "发送成功后本机库会删掉（Telegram 只留当前一组）。下载总是拉这一组，保持「继续」再爬。",
                             );
                         });
 

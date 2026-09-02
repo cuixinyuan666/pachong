@@ -1,6 +1,6 @@
 [package]
 name = "baidu_finance_rust"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 description = "A股全市场数据采集控制台（百度财经 + 东方财富）"
 
