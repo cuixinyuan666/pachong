@@ -1,0 +1,26 @@
+# 复制为 settings.toml 后按本机路径修改（settings.toml 不入库）
+[general]
+db_path = "market_data.db"
+checklist_path = "needed_check_list.json"
+log_path = "rust_crawl.log"
+
+[rate]
+min_interval = 1.0
+max_per_minute = 40
+
+[check]
+check_after_each_stock = true
+missing_count_threshold = 1
+trade_date = "latest"
+
+[rescrape]
+max_tries = 3
+backoff_minutes = [5, 15, 30]
+skip_on_non_trading_day = true
+force = true
+
+[pacing]
+interval_jitter_extra = 0.8
+micro_break_every = 50
+micro_break_min = 5.0
+micro_break_max = 25.0

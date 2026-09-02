@@ -1,0 +1,6 @@
+# GitHub Actions 打包 Windows exe 用；本地跑调试页只需标准库。
+# adata / easy-tdx / pandas：A 股代码清单过期后的刷新兜底。
+pandas>=2.0.0
+adata>=2.0.0
+easy-tdx
+pyinstaller>=6.0.0

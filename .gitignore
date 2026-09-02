@@ -1,0 +1,41 @@
+# 本地数据库与 WAL
+market_data.db
+market_data.db-shm
+market_data.db-wal
+
+# Cookie / 密钥（禁止入库）
+baidu_cookies.json
+
+# 运行日志
+*.log
+logs_archive.tar.gz
+_rust_build*.log
+*.status.txt
+
+# 本机路径配置与运行态清单
+settings.toml
+needed_check_list.json
+
+# 含抓取结果的大型 HTML（用脚本随时再生成）
+view_report.html
+view_report_em.html
+report_full.html
+market_data_viewer.html
+
+# Python / 打包产物
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+
+# Rust 本地工具链与编译缓存（体积极大）
+toolchain/
+# GUI 源码已不完整（缺 Cargo.toml / main.rs），暂不入库
+rust_crawler/
+
+# 编辑器 / 本机工具
+.vscode/
+.workbuddy/
+.cursor/
