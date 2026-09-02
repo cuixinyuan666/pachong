@@ -2,13 +2,13 @@
 
 百度财经 AI 技术分析 + 东方财富千股千评的本地爬虫与调试页。
 
-## 下载 exe
+## 下载 exe（Rust GUI）
 
-到 [Releases](https://github.com/cuixinyuan666/pachong/releases) 下载 `pachong-windows-x64.exe`，双击后会打开本机页面 `http://127.0.0.1:8765`（仅本机，不对外）。
+到 [Releases](https://github.com/cuixinyuan666/pachong/releases) 下载 `baidu_finance_rust-windows-x64.exe`，双击打开 **MarketPulse** 图形界面。
 
-数据库 `market_data.db`、日志、A 股代码清单会生成在 **exe 同一目录**。
+数据库 `market_data.db`、日志会写在 **exe 同一目录**（可把 `settings.toml` 放旁边改路径）。
 
-GitHub Actions 在每次打 `v*` 标签时自动编译并挂到该 Release。也可在 Actions 里手动 `Run workflow`。
+GitHub Actions 在 `windows-latest` 上 `cargo build --release`。打 `v*` 标签即自动挂到 Release。
 
 ## 源码运行
 

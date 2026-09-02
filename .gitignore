@@ -30,10 +30,10 @@ venv/
 build/
 dist/
 
-# Rust 本地工具链与编译缓存（体积极大）
+# Rust 本地工具链与编译缓存（体积极大，源码要入库）
 toolchain/
-# GUI 源码已不完整（缺 Cargo.toml / main.rs），暂不入库
-rust_crawler/
+rust_crawler/toolchain/
+rust_crawler/target/
 
 # 编辑器 / 本机工具
 .vscode/
