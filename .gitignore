@@ -5,6 +5,7 @@ market_data.db-wal
 
 # Cookie / 密钥（禁止入库）
 baidu_cookies.json
+telegram.json
 
 # 运行日志
 *.log

@@ -14,7 +14,7 @@ use crate::crawler::CrawlConfig;
 use crate::db::Db;
 use crate::http::RateLimiter;
 use crate::settings::Settings;
-use crate::state::{wait_user_ack, AppState, CrawlStatus, ErrorNotice, UserAck};
+use crate::state::{note_problem, wait_user_ack, AppState, CrawlStatus, ErrorNotice, UserAck};
 use crate::verify::{classify_kind, network_hint, source_verify_links};
 
 const EM_BASE: &str = "https://datacenter-web.eastmoney.com/api/data/v1/get";
@@ -789,13 +789,17 @@ pub fn run_em_crawler(
                 failed += 1;
                 let _ = db.bump_crawl_stats_source(&code, false, "fail", "em");
                 log(&format!(
-                    "落库失败 {code}: {e}；请打开源站核对: {}",
+                    "落库失败 {code}: {e}；网页: {}",
                     em_stock_page_url(&code)
                 ));
-                let ack = ask_em(&state, &code, &name, &format!("落库失败: {e}"));
-                if ack == UserAck::Stop {
-                    stop.store(true, Ordering::SeqCst);
-                }
+                note_problem(
+                    &state,
+                    "落库失败",
+                    &code,
+                    &name,
+                    &format!("落库失败: {e}"),
+                    &["em"],
+                );
             }
         }
 

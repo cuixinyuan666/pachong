@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use crate::http::{crawl_one, RateLimiter};
 use crate::models::StockRef;
-use crate::state::{wait_user_ack, AppState, CrawlStatus, ErrorNotice, UserAck};
+use crate::state::{note_problem, wait_user_ack, AppState, CrawlStatus, ErrorNotice, UserAck};
 use crate::db;
 use crate::settings::Settings;
 use crate::checklist::{CheckList, CheckItem, CheckStatus};
@@ -277,7 +277,7 @@ pub fn run_crawler(
         let single_start = Instant::now();
         let stock = StockRef { code: code.clone(), name: name.clone() };
 
-        // 出错必须弹窗确认或打开源站；选「重试」则本只再抓一次
+        // 单只失败/不完整只记网页链接，不弹窗；整只循环里仍处理 403 冷却
         loop {
             if stop.load(Ordering::SeqCst) {
                 break;
@@ -287,41 +287,26 @@ pub fn run_crawler(
                 Ok(parsed) => {
                     let empty = parsed.scores.update_time.is_none();
                     if empty {
-                        let ack = ask_user(
+                        note_problem(
                             &state,
+                            "未拿到数据",
                             &code,
                             &name,
-                            "本次未拿到数据（待人工确认，不是确认无数据）",
+                            "本次未拿到数据（不是确认源站无数据）",
                             &["baidu"],
                         );
-                        match ack {
-                            UserAck::Retry => continue,
-                            UserAck::Stop => {
-                                stop.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                            UserAck::Continue => {}
-                        }
                     }
                     if let Err(e) = db.save_snapshot(&config.trade_date, &stock, &parsed) {
-                        let ack = ask_user(
+                        note_problem(
                             &state,
+                            "落库失败",
                             &code,
                             &name,
                             &format!("保存失败: {e}"),
                             &["baidu"],
                         );
-                        match ack {
-                            UserAck::Retry => continue,
-                            UserAck::Stop => {
-                                stop.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                            UserAck::Continue => {
-                                failed += 1;
-                                let _ = db.bump_crawl_stats(&code, false, "fail");
-                            }
-                        }
+                        failed += 1;
+                        let _ = db.bump_crawl_stats(&code, false, "fail");
                     } else {
                         done += 1;
                         consecutive_403 = 0;
@@ -353,30 +338,18 @@ pub fn run_crawler(
                                             last_try,
                                             status,
                                         });
-                                        let ack = ask_user(&state, &code, &name, &detail, &["baidu"]);
-                                        match ack {
-                                            UserAck::Retry => continue,
-                                            UserAck::Stop => {
-                                                stop.store(true, Ordering::SeqCst);
-                                                break;
-                                            }
-                                            UserAck::Continue => {}
-                                        }
+                                        note_problem(&state, "数据不完整", &code, &name, &detail, &["baidu"]);
                                     }
                                 }
                                 Err(e) => {
-                                    let ack = ask_user(
+                                    note_problem(
                                         &state,
+                                        "数据不完整",
                                         &code,
                                         &name,
                                         &format!("完整性检查失败: {e}"),
                                         &["baidu"],
                                     );
-                                    if ack == UserAck::Stop {
-                                        stop.store(true, Ordering::SeqCst);
-                                    } else if ack == UserAck::Retry {
-                                        continue;
-                                    }
                                 }
                             }
                         }
@@ -386,15 +359,7 @@ pub fn run_crawler(
                 Err(e) => {
                     let msg = e.clone();
                     log(&format!("股票 {} 抓取失败: {}", code, e));
-                    let ack = ask_user(&state, &code, &name, &msg, &["baidu"]);
-                    match ack {
-                        UserAck::Retry => continue,
-                        UserAck::Stop => {
-                            stop.store(true, Ordering::SeqCst);
-                            break;
-                        }
-                        UserAck::Continue => {}
-                    }
+                    note_problem(&state, "抓取失败", &code, &name, &msg, &["baidu"]);
                     failed += 1;
                     let _ = db.bump_crawl_stats(&code, false, "fail");
                     if msg.contains("403") || msg.contains("Forbidden") || msg.contains("CHALLENGE") {

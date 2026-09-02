@@ -14,6 +14,7 @@ mod settings;
 mod checklist;
 mod em_crawler;
 mod verify;
+mod telegram;
 
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -29,7 +30,7 @@ use eframe::egui;
 use crate::crawler::{CrawlConfig, run_crawler};
 use crate::em_crawler::run_em_crawler;
 use crate::models::StockRef;
-use crate::state::{submit_ack, wait_user_ack, AppState, CrawlStatus, ErrorNotice, UserAck};
+use crate::state::{note_problem, submit_ack, wait_user_ack, AppState, CrawlStatus, ErrorNotice, ProblemItem, UserAck};
 use crate::db::Db;
 use crate::settings::Settings;
 use crate::checklist::{CheckList, CheckItem, CheckStatus};
@@ -103,6 +104,10 @@ struct CrawlerApp {
     net_mode: usize,
     /// 联网方式说明弹窗。
     show_net_help: bool,
+    tg_token: String,
+    tg_chat: String,
+    show_tg_help: bool,
+    tg_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Default for CrawlerApp {
@@ -145,6 +150,10 @@ impl Default for CrawlerApp {
             did_net_probe: false,
             net_mode: crate::http::current_proxy_mode().as_index(),
             show_net_help: false,
+            tg_token: crate::telegram::load().bot_token,
+            tg_chat: crate::telegram::load().chat_id,
+            show_tg_help: false,
+            tg_thread: None,
         }
     }
 }
@@ -587,6 +596,7 @@ impl CrawlerApp {
         stop.store(false, Ordering::SeqCst);
         if let Ok(mut g) = self.state.lock() {
             g.mute_error_kinds.clear();
+            g.problems.clear();
         }
         let settings = crate::settings::Settings::load();
         let mut checklist =
@@ -668,12 +678,18 @@ impl CrawlerApp {
                     ui.colored_label(DIM, &notice.hint);
                 }
                 ui.add_space(10.0);
-                ui.colored_label(INK, egui::RichText::new("打开源站核对").strong());
+                ui.colored_label(INK, egui::RichText::new("出问题的网页").strong());
+                let page_links: Vec<_> = notice
+                    .links
+                    .iter()
+                    .filter(|l| l.kind == "page")
+                    .cloned()
+                    .collect();
                 ui.horizontal_wrapped(|ui| {
-                    if notice.links.is_empty() {
-                        ui.colored_label(DIM, "（本条没有可跳转的源站链接）");
+                    if page_links.is_empty() {
+                        ui.colored_label(DIM, "（本条没有可跳转的网页）");
                     }
-                    for link in &notice.links {
+                    for link in &page_links {
                         let text = format!("{} · {}", link.source, link.label);
                         if ui.button(text).clicked() {
                             if let Err(e) = webbrowser::open(&link.url) {
@@ -685,9 +701,9 @@ impl CrawlerApp {
                     }
                 });
                 ui.add_space(6.0);
-                for link in &notice.links {
+                for link in &page_links {
                     ui.horizontal(|ui| {
-                        ui.colored_label(DIM, if link.kind == "page" { "页面" } else { "接口" });
+                        ui.colored_label(DIM, "网页");
                         ui.monospace(&link.url);
                     });
                 }
@@ -768,6 +784,7 @@ impl App for CrawlerApp {
             avg,
             logs,
             pending_error,
+            problems,
         ) = {
             let g = self.state.lock().unwrap();
             (
@@ -788,6 +805,7 @@ impl App for CrawlerApp {
                 g.avg_per_stock,
                 g.logs.clone(),
                 g.pending_error.clone(),
+                g.problems.clone(),
             )
         };
 
@@ -992,6 +1010,67 @@ impl App for CrawlerApp {
                                         self.net_mode,
                                     ));
                                     spawn_startup_probe(self.state.clone());
+                                }
+                            });
+                        });
+
+                        ui.add_space(8.0);
+                        panel(ui, "发送数据库到 Telegram", |ui| {
+                            ui.colored_label(DIM, "免费通道。国内请先开 VPN 再发。");
+                            ui.horizontal(|ui| {
+                                ui.colored_label(DIM, "Token");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.tg_token)
+                                        .password(true)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.colored_label(DIM, "Chat ID");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.tg_chat)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                            let tg_busy = self
+                                .tg_thread
+                                .as_ref()
+                                .map(|h| !h.is_finished())
+                                .unwrap_or(false);
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("怎么发").clicked() {
+                                    self.show_tg_help = true;
+                                }
+                                if ui
+                                    .add_enabled(!tg_busy, egui::Button::new(if tg_busy {
+                                        "正在发送…"
+                                    } else {
+                                        "发送数据库"
+                                    }))
+                                    .clicked()
+                                {
+                                    let cfg = crate::telegram::TelegramCfg {
+                                        bot_token: self.tg_token.trim().to_string(),
+                                        chat_id: self.tg_chat.trim().to_string(),
+                                    };
+                                    if let Err(e) = crate::telegram::save(&cfg) {
+                                        if let Ok(mut g) = self.state.lock() {
+                                            g.push_log(format!("保存 telegram.json 失败: {e}"));
+                                        }
+                                    }
+                                    let db = self.db_path_input.clone();
+                                    let state = self.state.clone();
+                                    self.tg_thread = Some(thread::spawn(move || {
+                                        let log = |s: &str| {
+                                            if let Ok(mut g) = state.lock() {
+                                                g.push_log(s.to_string());
+                                            }
+                                        };
+                                        match crate::telegram::send_database(&db, &cfg, &log) {
+                                            Ok(()) => {}
+                                            Err(e) => log(&format!("发送失败: {e}")),
+                                        }
+                                    }));
                                 }
                             });
                         });
@@ -1231,6 +1310,53 @@ impl App for CrawlerApp {
                                 ui.colored_label(DIM, format!("ETA {:.0}s", eta));
                             });
                         });
+
+                        ui.add_space(12.0);
+                        panel(ui, "失败或不完整（网页）", |ui| {
+                            ui.colored_label(
+                                DIM,
+                                format!("本轮 {} 条。点按钮打开对应网页，不卡住抓取。", problems.len()),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("导出全部链接").clicked() {
+                                    export_problem_links(&problems);
+                                }
+                            });
+                            egui::ScrollArea::vertical()
+                                .max_height(180.0)
+                                .show(ui, |ui| {
+                                    if problems.is_empty() {
+                                        ui.colored_label(DIM, "暂无");
+                                    }
+                                    for p in problems.iter().rev().take(80) {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.colored_label(
+                                                DANGER,
+                                                egui::RichText::new(&p.kind).small(),
+                                            );
+                                            ui.colored_label(
+                                                INK,
+                                                format!("{} {}", p.name, p.code),
+                                            );
+                                            if !p.page_url.is_empty() {
+                                                let label = if p.page_label.is_empty() {
+                                                    "打开网页".into()
+                                                } else {
+                                                    p.page_label.clone()
+                                                };
+                                                if ui.small_button(label).clicked() {
+                                                    let _ = webbrowser::open(&p.page_url);
+                                                }
+                                            }
+                                        });
+                                        ui.colored_label(DIM, &p.detail);
+                                        if !p.page_url.is_empty() {
+                                            ui.monospace(&p.page_url);
+                                        }
+                                        ui.add_space(4.0);
+                                    }
+                                });
+                        });
                     });
             });
 
@@ -1260,11 +1386,44 @@ impl App for CrawlerApp {
             }
         }
 
+        if self.show_tg_help {
+            let mut open = self.show_tg_help;
+            egui::Window::new("发送数据库到 Telegram：操作步骤")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(540.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(crate::telegram::help_text());
+                });
+            if !open {
+                self.show_tg_help = false;
+            }
+        }
+
         if pending_error.is_some() {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
+    }
+}
+
+fn export_problem_links(problems: &[ProblemItem]) {
+    let path = PathBuf::from(crate::settings::workspace_dir()).join("fail_links.txt");
+    let mut text = String::from("# 失败或不完整 — 网页链接（不是接口）\n\n");
+    for p in problems {
+        text.push_str(&format!(
+            "[{}] {} {} — {}\n{}\n\n",
+            p.kind, p.code, p.name, p.detail, p.page_url
+        ));
+    }
+    match std::fs::write(&path, text.as_bytes()) {
+        Ok(()) => {
+            let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
+        }
+        Err(_) => {}
     }
 }
 
@@ -1545,9 +1704,10 @@ fn run_check(settings: &Settings, state: Arc<Mutex<AppState>>) {
                 let n = missing.len();
                 if n >= threshold {
                     abnormal += 1;
+                    let detail = format!("完整性缺 {} 项: {:?}", n, missing);
                     log(&format!(
-                        "[check] ⚠ {} ({}) 缺 {} 项: {:?}",
-                        stock.code, stock.name, n, missing
+                        "[check] ⚠ {} ({}) {}",
+                        stock.code, stock.name, detail
                     ));
                     let prev = checklist.items.iter().find(|i| i.code == stock.code);
                     let tries = prev.map(|i| i.tries).unwrap_or(0);
@@ -1566,6 +1726,14 @@ fn run_check(settings: &Settings, state: Arc<Mutex<AppState>>) {
                         last_try,
                         status,
                     });
+                    note_problem(
+                        &state,
+                        "数据不完整",
+                        &stock.code,
+                        &stock.name,
+                        &detail,
+                        &["baidu"],
+                    );
                 }
             }
             Err(e) => log(&format!("[check] 查询失败 {}: {}", stock.code, e)),

@@ -30,6 +30,32 @@ pub fn em_list_page_url() -> String {
     "https://data.eastmoney.com/stockcomment/".into()
 }
 
+/// 给人看的网页（不含接口）。失败/不完整只给这个。
+pub fn page_links_for_stock(code: &str, sources: &[&str]) -> Vec<VerifyLink> {
+    let mut out = Vec::new();
+    if code.trim().is_empty() {
+        return out;
+    }
+    let srcs: Vec<String> = sources.iter().map(|s| s.to_lowercase()).collect();
+    if srcs.iter().any(|s| s == "baidu") {
+        out.push(VerifyLink {
+            source: "百度财经".into(),
+            kind: "page".into(),
+            label: "AI分析页".into(),
+            url: baidu_ai_page_url(code),
+        });
+    }
+    if srcs.iter().any(|s| s == "em") {
+        out.push(VerifyLink {
+            source: "东方财富".into(),
+            kind: "page".into(),
+            label: "千股千评页".into(),
+            url: em_stock_page_url(code),
+        });
+    }
+    out
+}
+
 pub fn source_verify_links(code: &str, sources: &[&str]) -> Vec<VerifyLink> {
     let mut out = Vec::new();
     let srcs: Vec<String> = sources.iter().map(|s| s.to_lowercase()).collect();

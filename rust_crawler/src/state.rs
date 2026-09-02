@@ -42,6 +42,16 @@ pub struct ErrorNotice {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProblemItem {
+    pub kind: String,
+    pub code: String,
+    pub name: String,
+    pub detail: String,
+    pub page_url: String,
+    pub page_label: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct AppState {
     pub total: usize,
     pub done: usize,
@@ -64,6 +74,8 @@ pub struct AppState {
     pub mute_error_kinds: HashSet<String>,
     /// 弹窗出现前的状态，点确认后还原（启动探测在空闲时不要变成「运行中」）
     pub resume_status: CrawlStatus,
+    /// 失败/不完整：只给人网页链接，不卡住整轮。
+    pub problems: Vec<ProblemItem>,
 }
 
 impl Default for AppState {
@@ -89,6 +101,7 @@ impl Default for AppState {
             error_ack_tx: None,
             mute_error_kinds: HashSet::new(),
             resume_status: CrawlStatus::Idle,
+            problems: Vec::new(),
         }
     }
 }
@@ -162,5 +175,42 @@ pub fn submit_ack(state: &Arc<Mutex<AppState>>, ack: UserAck, mute_this_kind: bo
             },
         };
         g.status_msg.clear();
+    }
+}
+
+/// 单只失败/不完整：记下网页链接，不弹窗卡住整轮。
+pub fn note_problem(
+    state: &Arc<Mutex<AppState>>,
+    kind: &str,
+    code: &str,
+    name: &str,
+    detail: &str,
+    sources: &[&str],
+) {
+    use crate::verify::page_links_for_stock;
+    let links = page_links_for_stock(code, sources);
+    let (page_url, page_label) = match links.first() {
+        Some(l) => (l.url.clone(), format!("{} · {}", l.source, l.label)),
+        None => (String::new(), String::new()),
+    };
+    if let Ok(mut g) = state.lock() {
+        let line = if page_url.is_empty() {
+            format!("⚠ [{kind}] {code} {name} — {detail}")
+        } else {
+            format!("⚠ [{kind}] {code} {name} — {detail}  网页: {page_url}")
+        };
+        g.push_log(line);
+        g.problems.push(ProblemItem {
+            kind: kind.to_string(),
+            code: code.to_string(),
+            name: name.to_string(),
+            detail: detail.to_string(),
+            page_url,
+            page_label,
+        });
+        if g.problems.len() > 500 {
+            let extra = g.problems.len() - 500;
+            g.problems.drain(0..extra);
+        }
     }
 }
