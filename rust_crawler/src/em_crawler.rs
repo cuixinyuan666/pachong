@@ -110,12 +110,12 @@ fn fetch_em_json(
     let mut last_err = String::new();
     for attempt in 1..=max_retries.max(1) {
         limiter.wait();
-        match client
-            .get(url)
-            .headers(headers.clone())
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .send()
-        {
+        match crate::http::send_get_with_fallback(
+            client,
+            url,
+            Some(&headers),
+            std::time::Duration::from_secs(timeout_secs),
+        ) {
             Ok(resp) => {
                 let status = resp.status();
                 if status.as_u16() == 403 {
@@ -138,7 +138,7 @@ fn fetch_em_json(
                 }
             }
             Err(e) => {
-                last_err = format!("网络错误: {e}");
+                last_err = format!("网络错误: {e}{}", crate::http::proxy_hint_suffix());
                 std::thread::sleep(std::time::Duration::from_secs_f64(
                     2.0_f64.powi((attempt - 1) as i32) + rand::random::<f64>(),
                 ));
@@ -518,12 +518,7 @@ pub fn run_em_crawler(
 
     let client = match crate::http::build_blocking_client(config.timeout) {
         Ok(c) => {
-            let px = crate::http::last_proxy_desc();
-            if px.is_empty() {
-                log("HTTP 客户端就绪（直连，未读到系统代理）");
-            } else {
-                log(&format!("HTTP 客户端就绪（代理 {px}）"));
-            }
+            log(&format!("HTTP 客户端就绪：{}", crate::http::last_proxy_desc()));
             c
         }
         Err(e) => {

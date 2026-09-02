@@ -1,13 +1,14 @@
 //! HTTP 客户端、URL 构造、JSON 解析、频率限制器。
 //! 严格移植自 Python 版 baidu_finance_ai_crawler.py 的字段路径与反爬逻辑。
 
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, COOKIE, ORIGIN, REFERER, USER_AGENT};
-use reqwest::Proxy;
+use reqwest::{NoProxy, Proxy};
 use serde_json::Value;
 use std::sync::OnceLock;
 
@@ -42,25 +43,117 @@ pub fn load_cookies_from_json_file(path: &str) -> Option<String> {
     }
 }
 
-static PROXY_HINT: OnceLock<String> = OnceLock::new();
+/// 联网方式：自动=代理端口死了就直连（VPN 关掉后的常见坑）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyMode {
+    Auto,
+    Direct,
+    System,
+}
+
+impl ProxyMode {
+    pub fn as_index(self) -> usize {
+        match self {
+            Self::Auto => 0,
+            Self::Direct => 1,
+            Self::System => 2,
+        }
+    }
+    pub fn from_index(i: usize) -> Self {
+        match i {
+            1 => Self::Direct,
+            2 => Self::System,
+            _ => Self::Auto,
+        }
+    }
+    fn as_key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Direct => "direct",
+            Self::System => "system",
+        }
+    }
+    fn from_key(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "direct" => Self::Direct,
+            "system" => Self::System,
+            _ => Self::Auto,
+        }
+    }
+}
+
+struct NetRuntime {
+    mode: ProxyMode,
+    using_proxy: bool,
+    desc: String,
+    /// 本轮已确认「代理走不通、改直连」后，后续请求都用这个客户端。
+    override_client: Option<Client>,
+}
+
+fn net() -> &'static Mutex<NetRuntime> {
+    static N: OnceLock<Mutex<NetRuntime>> = OnceLock::new();
+    N.get_or_init(|| {
+        Mutex::new(NetRuntime {
+            mode: load_proxy_mode(),
+            using_proxy: false,
+            desc: String::new(),
+            override_client: None,
+        })
+    })
+}
+
+fn network_mode_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(crate::settings::workspace_dir()).join("network_mode.txt")
+}
+
+fn load_proxy_mode() -> ProxyMode {
+    std::fs::read_to_string(network_mode_path())
+        .ok()
+        .map(|s| ProxyMode::from_key(&s))
+        .unwrap_or(ProxyMode::Auto)
+}
+
+fn persist_proxy_mode(mode: ProxyMode) {
+    let _ = std::fs::write(network_mode_path(), mode.as_key());
+}
+
+pub fn current_proxy_mode() -> ProxyMode {
+    net().lock().map(|g| g.mode).unwrap_or(ProxyMode::Auto)
+}
+
+pub fn set_proxy_mode(mode: ProxyMode) {
+    persist_proxy_mode(mode);
+    if let Ok(mut g) = net().lock() {
+        g.mode = mode;
+        g.override_client = None;
+        g.using_proxy = false;
+        g.desc.clear();
+    }
+}
 
 pub fn proxy_hint_suffix() -> String {
-    match PROXY_HINT.get() {
-        Some(s) if !s.is_empty() => format!("（当前代理: {s}）"),
-        _ => "（未使用系统代理；若本机开了 Clash，请开系统代理或设 HTTPS_PROXY）".into(),
+    let desc = last_proxy_desc();
+    if desc.is_empty() {
+        "（当前直连）".into()
+    } else {
+        format!("（{desc}）")
     }
 }
 
 pub fn last_proxy_desc() -> String {
-    PROXY_HINT.get().cloned().unwrap_or_default()
+    net().lock().map(|g| g.desc.clone()).unwrap_or_default()
 }
 
-/// 读环境变量，再读 Windows「Internet 设置」系统代理（Clash 常见 127.0.0.1:7890）。
-fn detect_proxy_url() -> Option<String> {
+pub fn session_using_proxy() -> bool {
+    net().lock().map(|g| g.using_proxy).unwrap_or(false)
+}
+
+/// 读环境变量，再读 Windows 系统代理。VPN 关掉后这两处经常还留着 127.0.0.1:端口。
+pub fn detect_proxy_url() -> Option<String> {
     for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
         if let Ok(v) = std::env::var(key) {
             let v = v.trim().to_string();
-            if !v.is_empty() {
+            if !v.is_empty() && !v.eq_ignore_ascii_case("direct") {
                 return Some(normalize_proxy(&v));
             }
         }
@@ -70,6 +163,9 @@ fn detect_proxy_url() -> Option<String> {
 
 fn normalize_proxy(raw: &str) -> String {
     let s = raw.trim();
+    if s.eq_ignore_ascii_case("direct") {
+        return String::new();
+    }
     if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("socks") {
         s.to_string()
     } else {
@@ -84,19 +180,16 @@ fn windows_system_proxy() -> Option<String> {
         .ok()?;
     let enable: u32 = key.get_value("ProxyEnable").unwrap_or(0);
     if enable == 0 {
-        let pac: String = key.get_value("AutoConfigURL").unwrap_or_default();
-        if !pac.is_empty() {
-            let _ = PROXY_HINT.set(format!("仅 PAC({pac})，程序无法自动用 PAC，请改开系统代理"));
-        }
         return None;
     }
     let server: String = key.get_value("ProxyServer").ok()?;
     if server.trim().is_empty() {
         return None;
     }
-    // "http=127.0.0.1:7890;https=127.0.0.1:7890" 或 "127.0.0.1:7890"
+    // "http=127.0.0.1:7890;https=127.0.0.1:7890;socks=127.0.0.1:1080" 或 "127.0.0.1:7890"
     let mut https = None;
     let mut http = None;
+    let mut socks = None;
     if server.contains('=') {
         for part in server.split(';') {
             let mut kv = part.splitn(2, '=');
@@ -109,33 +202,248 @@ fn windows_system_proxy() -> Option<String> {
                 https = Some(v.to_string());
             } else if k == "http" {
                 http = Some(v.to_string());
+            } else if k == "socks" || k == "socks5" || k == "socks5h" {
+                socks = Some(format!("socks5h://{v}"));
             }
         }
     } else {
         https = Some(server.trim().to_string());
     }
-    let host = https.or(http)?;
-    Some(normalize_proxy(&host))
+    if let Some(host) = https.or(http) {
+        return Some(normalize_proxy(&host));
+    }
+    socks
 }
 
-/// 带系统代理 + cookie 仓的 HTTP 客户端。新电脑没走代理时会整表「网络错误」。
-pub fn build_blocking_client(timeout_secs: u64) -> Result<Client, String> {
+fn windows_proxy_override() -> String {
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    let Ok(key) = hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings") else {
+        return String::new();
+    };
+    let s: String = key.get_value("ProxyOverride").unwrap_or_default();
+    s.replace(';', ",")
+}
+
+fn bypass_list() -> String {
+    let mut parts = Vec::new();
+    for k in ["NO_PROXY", "no_proxy"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                parts.push(v.replace(';', ","));
+            }
+        }
+    }
+    let ov = windows_proxy_override();
+    if !ov.is_empty() {
+        parts.push(ov);
+    }
+    parts.join(",")
+}
+
+fn split_proxy_host_port(url: &str) -> Option<(String, u16)> {
+    let mut s = url.trim();
+    for pfx in ["http://", "https://", "socks5h://", "socks5://", "socks://"] {
+        if let Some(rest) = s.strip_prefix(pfx) {
+            s = rest;
+            break;
+        }
+    }
+    let s = s.split('@').next_back().unwrap_or(s);
+    let s = s.split('/').next().unwrap_or(s);
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()?),
+        None => (s, 80u16),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    if host.is_empty() {
+        None
+    } else {
+        Some((host, port))
+    }
+}
+
+/// 代理端口还在不在听。VPN/Clash 关掉后 127.0.0.1:7890 通常 connection refused。
+fn proxy_tcp_alive(url: &str) -> bool {
+    let Some((host, port)) = split_proxy_host_port(url) else {
+        return false;
+    };
+    let addr = format!("{host}:{port}");
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        return TcpStream::connect_timeout(&sa, Duration::from_secs(2)).is_ok();
+    }
+    use std::net::ToSocketAddrs;
+    let Ok(iter) = addr.to_socket_addrs() else {
+        return false;
+    };
+    for a in iter {
+        if TcpStream::connect_timeout(&a, Duration::from_secs(2)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn looks_like_transport_error(e: &reqwest::Error) -> bool {
+    if e.is_connect() || e.is_timeout() {
+        return true;
+    }
+    let s = e.to_string().to_lowercase();
+    s.contains("proxy")
+        || s.contains("connect")
+        || s.contains("connection")
+        || s.contains("tunnel")
+        || s.contains("refused")
+        || s.contains("reset")
+        || s.contains("timed out")
+        || s.contains("timeout")
+        || s.contains("10061")
+        || s.contains("10060")
+        || s.contains("socks")
+        || s.contains("dns")
+        || s.contains("resolve")
+}
+
+/// 选定本轮实际使用的代理（或直连）。自动模式：端口死了就直连。
+fn choose_proxy() -> (Option<String>, String) {
+    let mode = current_proxy_mode();
+    let detected = detect_proxy_url().filter(|s| !s.is_empty());
+    match mode {
+        ProxyMode::Direct => (None, "强制直连（不走系统代理/环境变量）".into()),
+        ProxyMode::System => match detected {
+            Some(url) => {
+                let alive = proxy_tcp_alive(&url);
+                if alive {
+                    (Some(url.clone()), format!("强制系统代理 {url}"))
+                } else {
+                    (
+                        Some(url.clone()),
+                        format!("强制系统代理 {url}（端口现在连不上，VPN 多半已关）"),
+                    )
+                }
+            }
+            None => (None, "强制系统代理，但没读到代理，改为直连".into()),
+        },
+        ProxyMode::Auto => match detected {
+            Some(url) => {
+                if proxy_tcp_alive(&url) {
+                    (Some(url.clone()), format!("自动·走代理 {url}"))
+                } else {
+                    (
+                        None,
+                        format!("自动·系统代理 {url} 已失效（VPN/Clash 关掉后常见），改直连"),
+                    )
+                }
+            }
+            None => (None, "自动·直连（未读到系统代理）".into()),
+        },
+    }
+}
+
+fn attach_proxy(builder: reqwest::blocking::ClientBuilder, url: &str) -> Result<reqwest::blocking::ClientBuilder, String> {
+    let mut proxy = Proxy::all(url).map_err(|e| format!("代理无效 {url}: {e}"))?;
+    let bypass = bypass_list();
+    if !bypass.is_empty() {
+        if let Some(np) = NoProxy::from_string(&bypass) {
+            proxy = proxy.no_proxy(Some(np));
+        }
+    }
+    Ok(builder.proxy(proxy))
+}
+
+fn client_builder(timeout_secs: u64) -> reqwest::blocking::ClientBuilder {
     let timeout = Duration::from_secs(timeout_secs.max(20));
-    let mut b = Client::builder()
+    Client::builder()
         .timeout(timeout)
-        .connect_timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(8))
+        .tcp_nodelay(true)
+        .pool_idle_timeout(Duration::from_secs(30))
         .cookie_store(true)
         .gzip(true)
         .deflate(true)
-        .brotli(true);
-    if let Some(url) = detect_proxy_url() {
-        let _ = PROXY_HINT.set(url.clone());
-        let proxy = Proxy::all(&url).map_err(|e| format!("代理无效 {url}: {e}"))?;
-        b = b.proxy(proxy);
-    } else {
-        let _ = PROXY_HINT.set(String::new());
+        .brotli(true)
+        .no_proxy()
+}
+
+fn build_client_with_proxy(timeout_secs: u64, proxy: Option<&str>) -> Result<Client, String> {
+    let mut b = client_builder(timeout_secs);
+    if let Some(url) = proxy {
+        b = attach_proxy(b, url)?;
     }
     b.build().map_err(|e| e.to_string())
+}
+
+/// 带系统代理 + cookie 仓的 HTTP 客户端。代理端口死了（VPN 已关）时自动直连。
+pub fn build_blocking_client(timeout_secs: u64) -> Result<Client, String> {
+    if let Ok(g) = net().lock() {
+        if let Some(c) = g.override_client.clone() {
+            return Ok(c);
+        }
+    }
+    let (proxy, desc) = choose_proxy();
+    let client = build_client_with_proxy(timeout_secs, proxy.as_deref())?;
+    if let Ok(mut g) = net().lock() {
+        g.using_proxy = proxy.is_some();
+        g.desc = desc;
+        g.override_client = None;
+    }
+    Ok(client)
+}
+
+fn build_direct_client(timeout_secs: u64) -> Result<Client, String> {
+    build_client_with_proxy(timeout_secs, None)
+}
+
+fn remember_direct_override(client: Client, reason: &str) {
+    if let Ok(mut g) = net().lock() {
+        g.using_proxy = false;
+        g.desc = reason.to_string();
+        g.override_client = Some(client);
+    }
+}
+
+/// 走代理失败时改直连再打一次。浏览器能开、程序不能，多半就是这个。
+pub fn send_get_with_fallback(
+    client: &Client,
+    url: &str,
+    headers: Option<&HeaderMap>,
+    timeout: Duration,
+) -> Result<reqwest::blocking::Response, reqwest::Error> {
+    let live = if let Ok(g) = net().lock() {
+        g.override_client.clone().unwrap_or_else(|| client.clone())
+    } else {
+        client.clone()
+    };
+    let mut req = live.get(url).timeout(timeout);
+    if let Some(h) = headers {
+        req = req.headers(h.clone());
+    }
+    match req.send() {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            if session_using_proxy() && looks_like_transport_error(&e) {
+                if let Ok(direct) = build_direct_client(timeout.as_secs().max(20)) {
+                    let mut req2 = direct.get(url).timeout(timeout);
+                    if let Some(h) = headers {
+                        req2 = req2.headers(h.clone());
+                    }
+                    match req2.send() {
+                        Ok(r) => {
+                            remember_direct_override(
+                                direct,
+                                "请求时代理失败，已改直连（VPN 关掉后系统代理常是死端口）",
+                            );
+                            Ok(r)
+                        }
+                        Err(_) => Err(e),
+                    }
+                } else {
+                    Err(e)
+                }
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 pub const API_HOST: &str = "https://finance.pae.baidu.com";
@@ -378,11 +686,12 @@ pub fn fetch_json(
     let mut last_err = String::new();
     for attempt in 1..=max_retries {
         limiter.wait();
-        let resp = client
-            .get(url)
-            .headers(headers.clone())
-            .timeout(Duration::from_secs(timeout))
-            .send();
+        let resp = crate::http::send_get_with_fallback(
+            client,
+            url,
+            Some(headers),
+            Duration::from_secs(timeout),
+        );
         match resp {
             Ok(r) => {
                 let status = r.status();
@@ -471,12 +780,12 @@ pub fn warm_up(client: &Client, code: &str) {
     let ua = random_ua();
     let headers = build_headers(&referer, ua);
     let url = format!("{}/ai-tech-analysi/stock/ab-{}", PAGE_HOST, code);
-    if let Ok(resp) = client
-        .get(&url)
-        .headers(headers)
-        .timeout(Duration::from_secs(10))
-        .send()
-    {
+    if let Ok(resp) = crate::http::send_get_with_fallback(
+        client,
+        &url,
+        Some(&headers),
+        Duration::from_secs(10),
+    ) {
         // 丢弃 body，仅为了让 cookie jar 记录 Set-Cookie
         let _ = resp.bytes();
     }

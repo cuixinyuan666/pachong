@@ -99,6 +99,10 @@ struct CrawlerApp {
     mute_same_kind: bool,
     /// 启动后只做一次网络探测。
     did_net_probe: bool,
+    /// 联网方式：0自动 1强制直连 2走系统代理
+    net_mode: usize,
+    /// 联网方式说明弹窗。
+    show_net_help: bool,
 }
 
 impl Default for CrawlerApp {
@@ -139,6 +143,8 @@ impl Default for CrawlerApp {
             did_maximize: false,
             mute_same_kind: false,
             did_net_probe: false,
+            net_mode: crate::http::current_proxy_mode().as_index(),
+            show_net_help: false,
         }
     }
 }
@@ -958,6 +964,39 @@ impl App for CrawlerApp {
                         });
 
                         ui.add_space(8.0);
+                        panel(ui, "联网方式", |ui| {
+                            let old = self.net_mode;
+                            ui.radio_value(&mut self.net_mode, 0, "自动(代理死了就直连)");
+                            ui.radio_value(&mut self.net_mode, 1, "强制直连");
+                            ui.radio_value(&mut self.net_mode, 2, "走系统代理");
+                            if self.net_mode != old {
+                                crate::http::set_proxy_mode(crate::http::ProxyMode::from_index(
+                                    self.net_mode,
+                                ));
+                                let name = match self.net_mode {
+                                    1 => "强制直连",
+                                    2 => "走系统代理",
+                                    _ => "自动(代理死了就直连)",
+                                };
+                                if let Ok(mut g) = self.state.lock() {
+                                    g.push_log(format!("联网方式已改为：{name}（下次抓取/重新探测生效）"));
+                                }
+                            }
+                            ui.colored_label(DIM, crate::http::last_proxy_desc());
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("这种方式怎么用").clicked() {
+                                    self.show_net_help = true;
+                                }
+                                if ui.button("重新探测").clicked() {
+                                    crate::http::set_proxy_mode(crate::http::ProxyMode::from_index(
+                                        self.net_mode,
+                                    ));
+                                    spawn_startup_probe(self.state.clone());
+                                }
+                            });
+                        });
+
+                        ui.add_space(8.0);
                         panel(ui, "数据源与续爬", |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.radio_value(&mut self.source_mode, 0, "仅百度");
@@ -1199,6 +1238,28 @@ impl App for CrawlerApp {
             self.show_error_dialog(ctx, notice);
         }
 
+        if self.show_net_help {
+            let mut open = self.show_net_help;
+            egui::Window::new("联网方式：操作步骤")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(520.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("VPN 关掉后网页能开、爬虫不能：多半不是源站没数据，是系统还留着死代理。");
+                    ui.add_space(6.0);
+                    ui.label("1) 推荐「自动」：先看系统代理 / HTTPS_PROXY 的端口还在不在听。VPN、Clash 关掉后 127.0.0.1:7890 通常已经没人听，程序改直连，和浏览器一致。");
+                    ui.label("2) 仍失败就点「强制直连」。完全不走代理，适合刚关 VPN、网页已经能开的情况。");
+                    ui.label("3) 必须翻墙才能到源站时，先打开 VPN/Clash 的系统代理，再选「走系统代理」。");
+                    ui.label("4) 点「重新探测」会立刻打百度财经和东财。失败会弹窗，可点源站链接核对。");
+                    ui.label("5) 浏览器能开、程序提示 DNS/resolve：浏览器可能开了安全 DNS，本机 DNS 还是 VPN 的。可在网卡里改 DNS，或 ipconfig /flushdns。");
+                });
+            if !open {
+                self.show_net_help = false;
+            }
+        }
+
         if pending_error.is_some() {
             ctx.request_repaint();
         } else {
@@ -1215,23 +1276,26 @@ fn popup_notice(state: &Arc<Mutex<AppState>>, notice: ErrorNotice) {
     });
 }
 
-/// 启动后探测百度/东财是否通；新电脑防火墙/代理问题会在这里先弹出来。
+/// 启动后探测百度/东财是否通；VPN 关掉后的死代理会在这里改直连。
 fn spawn_startup_probe(state: Arc<Mutex<AppState>>) {
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(400));
         if let Ok(g) = state.lock() {
-            if !matches!(g.status, CrawlStatus::Idle) {
+            if matches!(
+                g.status,
+                CrawlStatus::Running | CrawlStatus::Cooling | CrawlStatus::NeedConfirm
+            ) {
                 return;
+            }
+        }
+        if let Some(px) = crate::http::detect_proxy_url() {
+            if let Ok(mut g) = state.lock() {
+                g.push_log(format!("读到系统/环境代理: {px}"));
             }
         }
         let client = match crate::http::build_blocking_client(25) {
             Ok(c) => c,
             Err(e) => {
-                if let Ok(g) = state.lock() {
-                    if !matches!(g.status, CrawlStatus::Idle) {
-                        return;
-                    }
-                }
                 let _ = wait_user_ack(
                     &state,
                     ErrorNotice {
@@ -1246,7 +1310,14 @@ fn spawn_startup_probe(state: Arc<Mutex<AppState>>) {
                 return;
             }
         };
+        if let Ok(mut g) = state.lock() {
+            g.push_log(format!("联网探测使用：{}", crate::http::last_proxy_desc()));
+        }
         let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(ua) {
+            headers.insert(reqwest::header::USER_AGENT, v);
+        }
         let checks: [(&str, String, Vec<crate::verify::VerifyLink>); 3] = [
             (
                 "百度财经首页",
@@ -1267,11 +1338,12 @@ fn spawn_startup_probe(state: Arc<Mutex<AppState>>) {
         let mut fails: Vec<String> = Vec::new();
         let mut links = Vec::new();
         for (name, url, ln) in &checks {
-            match client
-                .get(url)
-                .header(reqwest::header::USER_AGENT, ua)
-                .send()
-            {
+            match crate::http::send_get_with_fallback(
+                &client,
+                url,
+                Some(&headers),
+                Duration::from_secs(20),
+            ) {
                 Ok(resp) => {
                     let code = resp.status().as_u16();
                     // 403/401 说明已经连上（多半是 Cookie），不算「网络错误」
@@ -1291,17 +1363,15 @@ fn spawn_startup_probe(state: Arc<Mutex<AppState>>) {
         }
         if fails.is_empty() {
             if let Ok(mut g) = state.lock() {
-                let px = crate::http::last_proxy_desc();
-                if px.is_empty() {
-                    g.push_log("启动探测：百度财经 / 东财网络可达（直连）".into());
-                } else {
-                    g.push_log(format!("启动探测：百度财经 / 东财网络可达（代理 {px}）"));
-                }
+                g.push_log(format!(
+                    "启动探测：百度财经 / 东财可达。{}",
+                    crate::http::last_proxy_desc()
+                ));
             }
             return;
         }
         if let Ok(g) = state.lock() {
-            if !matches!(g.status, CrawlStatus::Idle) {
+            if matches!(g.status, CrawlStatus::Running | CrawlStatus::Cooling) {
                 return;
             }
         }

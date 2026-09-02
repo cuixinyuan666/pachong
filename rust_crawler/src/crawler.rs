@@ -147,15 +147,10 @@ pub fn run_crawler(
         }
     };
 
-    // 单 HTTP 客户端：走系统代理 + cookie 仓（新电脑不走代理会整表网络错误）
+    // 单 HTTP 客户端：代理端口死了（VPN 已关）就直连，避免整表网络错误
     let client = match crate::http::build_blocking_client(config.timeout) {
         Ok(c) => {
-            let px = crate::http::last_proxy_desc();
-            if px.is_empty() {
-                log("HTTP 客户端就绪（直连，未读到系统代理）");
-            } else {
-                log(&format!("HTTP 客户端就绪（代理 {px}）"));
-            }
+            log(&format!("HTTP 客户端就绪：{}", crate::http::last_proxy_desc()));
             c
         }
         Err(e) => {

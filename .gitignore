@@ -14,6 +14,7 @@ _rust_build*.log
 
 # 本机路径配置与运行态清单
 settings.toml
+network_mode.txt
 needed_check_list.json
 
 # 含抓取结果的大型 HTML（用脚本随时再生成）
