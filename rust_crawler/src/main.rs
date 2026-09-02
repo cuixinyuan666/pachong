@@ -764,6 +764,15 @@ impl App for CrawlerApp {
             self.did_net_probe = true;
             spawn_startup_probe(self.state.clone());
         }
+        if self.tg_thread.as_ref().map(|h| h.is_finished()).unwrap_or(false) {
+            if let Some(h) = self.tg_thread.take() {
+                let _ = h.join();
+                self.trade_date_input = default_trade_date(&self.db_path_input);
+                self.existing_count =
+                    count_existing(&self.db_path_input, &self.trade_date_input);
+                self.resume_mode = true;
+            }
+        }
         apply_theme(ctx);
 
         let (
@@ -1052,6 +1061,7 @@ impl App for CrawlerApp {
                                     let cfg = crate::telegram::TelegramCfg {
                                         bot_token: self.tg_token.trim().to_string(),
                                         chat_id: self.tg_chat.trim().to_string(),
+                                        last_file_id: crate::telegram::load().last_file_id,
                                     };
                                     if let Err(e) = crate::telegram::save(&cfg) {
                                         if let Ok(mut g) = self.state.lock() {
@@ -1072,7 +1082,61 @@ impl App for CrawlerApp {
                                         }
                                     }));
                                 }
+                                if ui
+                                    .add_enabled(!tg_busy && !is_busy, egui::Button::new("下载历史库"))
+                                    .clicked()
+                                {
+                                    let cfg = crate::telegram::TelegramCfg {
+                                        bot_token: self.tg_token.trim().to_string(),
+                                        chat_id: self.tg_chat.trim().to_string(),
+                                        last_file_id: crate::telegram::load().last_file_id,
+                                    };
+                                    let _ = crate::telegram::save(&cfg);
+                                    let db = self.db_path_input.clone();
+                                    let state = self.state.clone();
+                                    self.tg_thread = Some(thread::spawn(move || {
+                                        let log = |s: &str| {
+                                            if let Ok(mut g) = state.lock() {
+                                                g.push_log(s.to_string());
+                                            }
+                                        };
+                                        match crate::telegram::download_latest_database(&db, &cfg, &log)
+                                        {
+                                            Ok(()) => {}
+                                            Err(e) => log(&format!("下载历史库失败: {e}")),
+                                        }
+                                    }));
+                                }
+                                if ui
+                                    .add_enabled(!tg_busy && !is_busy, egui::Button::new("导入本地历史库"))
+                                    .clicked()
+                                {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("历史库", &["gz", "db"])
+                                        .pick_file()
+                                    {
+                                        let db = self.db_path_input.clone();
+                                        let state = self.state.clone();
+                                        self.tg_thread = Some(thread::spawn(move || {
+                                            let log = |s: &str| {
+                                                if let Ok(mut g) = state.lock() {
+                                                    g.push_log(s.to_string());
+                                                }
+                                            };
+                                            match crate::telegram::install_history_file(
+                                                &path, &db, &log,
+                                            ) {
+                                                Ok(()) => {}
+                                                Err(e) => log(&format!("导入历史库失败: {e}")),
+                                            }
+                                        }));
+                                    }
+                                }
                             });
+                            ui.colored_label(
+                                DIM,
+                                "另一台电脑：先把压缩包转发给 bot，再下载；然后保持「继续」开始抓取。",
+                            );
                         });
 
                         ui.add_space(8.0);
