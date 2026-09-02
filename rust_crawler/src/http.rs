@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, COOKIE, ORIGIN, REFERER, USER_AGENT};
+use reqwest::Proxy;
 use serde_json::Value;
 use std::sync::OnceLock;
 
@@ -39,6 +40,102 @@ pub fn load_cookies_from_json_file(path: &str) -> Option<String> {
     } else {
         Some(parts.join("; "))
     }
+}
+
+static PROXY_HINT: OnceLock<String> = OnceLock::new();
+
+pub fn proxy_hint_suffix() -> String {
+    match PROXY_HINT.get() {
+        Some(s) if !s.is_empty() => format!("（当前代理: {s}）"),
+        _ => "（未使用系统代理；若本机开了 Clash，请开系统代理或设 HTTPS_PROXY）".into(),
+    }
+}
+
+pub fn last_proxy_desc() -> String {
+    PROXY_HINT.get().cloned().unwrap_or_default()
+}
+
+/// 读环境变量，再读 Windows「Internet 设置」系统代理（Clash 常见 127.0.0.1:7890）。
+fn detect_proxy_url() -> Option<String> {
+    for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(normalize_proxy(&v));
+            }
+        }
+    }
+    windows_system_proxy()
+}
+
+fn normalize_proxy(raw: &str) -> String {
+    let s = raw.trim();
+    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("socks") {
+        s.to_string()
+    } else {
+        format!("http://{s}")
+    }
+}
+
+fn windows_system_proxy() -> Option<String> {
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    let key = hkcu
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+        .ok()?;
+    let enable: u32 = key.get_value("ProxyEnable").unwrap_or(0);
+    if enable == 0 {
+        let pac: String = key.get_value("AutoConfigURL").unwrap_or_default();
+        if !pac.is_empty() {
+            let _ = PROXY_HINT.set(format!("仅 PAC({pac})，程序无法自动用 PAC，请改开系统代理"));
+        }
+        return None;
+    }
+    let server: String = key.get_value("ProxyServer").ok()?;
+    if server.trim().is_empty() {
+        return None;
+    }
+    // "http=127.0.0.1:7890;https=127.0.0.1:7890" 或 "127.0.0.1:7890"
+    let mut https = None;
+    let mut http = None;
+    if server.contains('=') {
+        for part in server.split(';') {
+            let mut kv = part.splitn(2, '=');
+            let k = kv.next().unwrap_or("").trim().to_lowercase();
+            let v = kv.next().unwrap_or("").trim();
+            if v.is_empty() {
+                continue;
+            }
+            if k == "https" {
+                https = Some(v.to_string());
+            } else if k == "http" {
+                http = Some(v.to_string());
+            }
+        }
+    } else {
+        https = Some(server.trim().to_string());
+    }
+    let host = https.or(http)?;
+    Some(normalize_proxy(&host))
+}
+
+/// 带系统代理 + cookie 仓的 HTTP 客户端。新电脑没走代理时会整表「网络错误」。
+pub fn build_blocking_client(timeout_secs: u64) -> Result<Client, String> {
+    let timeout = Duration::from_secs(timeout_secs.max(20));
+    let mut b = Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(15))
+        .cookie_store(true)
+        .gzip(true)
+        .deflate(true)
+        .brotli(true);
+    if let Some(url) = detect_proxy_url() {
+        let _ = PROXY_HINT.set(url.clone());
+        let proxy = Proxy::all(&url).map_err(|e| format!("代理无效 {url}: {e}"))?;
+        b = b.proxy(proxy);
+    } else {
+        let _ = PROXY_HINT.set(String::new());
+    }
+    b.build().map_err(|e| e.to_string())
 }
 
 pub const API_HOST: &str = "https://finance.pae.baidu.com";
@@ -90,8 +187,7 @@ fn build_headers(referer: &str, p: &UaProfile) -> HeaderMap {
     h.insert(REFERER, HeaderValue::from_str(referer).unwrap());
     h.insert(ORIGIN, HeaderValue::from_static(PAGE_HOST));
     h.insert(HeaderName::from_static("x-requested-with"), HeaderValue::from_static("XMLHttpRequest"));
-    h.insert(HeaderName::from_static("accept-encoding"), HeaderValue::from_static("gzip, deflate, br"));
-    h.insert(HeaderName::from_static("connection"), HeaderValue::from_static("keep-alive"));
+    // Accept-Encoding 交给 reqwest（gzip/deflate/br 特性），不要手写 br 否则解不开会误判
     h.insert(HeaderName::from_static("sec-fetch-dest"), HeaderValue::from_static("empty"));
     h.insert(HeaderName::from_static("sec-fetch-mode"), HeaderValue::from_static("cors"));
     h.insert(HeaderName::from_static("sec-fetch-site"), HeaderValue::from_static("cross-site"));
@@ -357,7 +453,7 @@ pub fn fetch_json(
             Err(e) => {
                 let backoff = 2.0_f64.powi((attempt as i32) - 1) + rand::random::<f64>();
                 sleep_secs(backoff);
-                last_err = format!("网络错误: {}", e);
+                last_err = format!("网络错误: {}{}", e, proxy_hint_suffix());
                 continue;
             }
         }

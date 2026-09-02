@@ -14,7 +14,8 @@ use crate::crawler::CrawlConfig;
 use crate::db::Db;
 use crate::http::RateLimiter;
 use crate::settings::Settings;
-use crate::state::{AppState, CrawlStatus};
+use crate::state::{wait_user_ack, AppState, CrawlStatus, ErrorNotice, UserAck};
+use crate::verify::{classify_kind, network_hint, source_verify_links};
 
 const EM_BASE: &str = "https://datacenter-web.eastmoney.com/api/data/v1/get";
 const EM_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
@@ -137,7 +138,7 @@ fn fetch_em_json(
                 }
             }
             Err(e) => {
-                last_err = e.to_string();
+                last_err = format!("网络错误: {e}");
                 std::thread::sleep(std::time::Duration::from_secs_f64(
                     2.0_f64.powi((attempt - 1) as i32) + rand::random::<f64>(),
                 ));
@@ -166,9 +167,10 @@ fn fetch_stocknew_all(
     max_retries: u32,
     timeout: u64,
     log: &dyn Fn(&str),
-) -> Vec<Value> {
+) -> (Vec<Value>, Option<String>) {
     let mut rows = Vec::new();
     let mut pn = 1usize;
+    let mut last_fail = None;
     log("开始分页拉取东财 RPT_DMSK_TS_STOCKNEW …");
     loop {
         let url = em_url(
@@ -180,27 +182,32 @@ fn fetch_stocknew_all(
                 ("sortTypes", "1".into()),
             ],
         );
-        let Ok(j) = fetch_em_json(client, limiter, &url, max_retries, timeout) else {
-            log(&format!("批量诊断第 {pn} 页失败，停止分页"));
-            break;
-        };
-        let data = result_data(&j);
-        if data.is_empty() {
-            if pn == 1 {
-                log(&em_empty_hint(&url));
+        match fetch_em_json(client, limiter, &url, max_retries, timeout) {
+            Ok(j) => {
+                let data = result_data(&j);
+                if data.is_empty() {
+                    if pn == 1 {
+                        log(&em_empty_hint(&url));
+                    }
+                    break;
+                }
+                let n = data.len();
+                rows.extend(data);
+                log(&format!("批量诊断第 {pn} 页: +{n}，累计 {}", rows.len()));
+                if n < PAGE_SIZE {
+                    break;
+                }
+                pn += 1;
             }
-            break;
+            Err(e) => {
+                last_fail = Some(e.to_string());
+                log(&format!("批量诊断第 {pn} 页失败: {e}"));
+                break;
+            }
         }
-        let n = data.len();
-        rows.extend(data);
-        log(&format!("批量诊断第 {pn} 页: +{n}，累计 {}", rows.len()));
-        if n < PAGE_SIZE {
-            break;
-        }
-        pn += 1;
     }
     log(&format!("批量诊断完成，共 {} 支", rows.len()));
-    rows
+    (rows, last_fail)
 }
 
 fn save_diag_text(
@@ -449,6 +456,26 @@ fn save_popularity(
     );
 }
 
+fn ask_em(state: &Arc<Mutex<AppState>>, code: &str, name: &str, detail: &str) -> UserAck {
+    let kind = classify_kind(detail);
+    let hint = if kind == "网络错误" {
+        network_hint().to_string()
+    } else {
+        "未拿到不等于源站确认无数据。请打开东财千股千评页核对。".into()
+    };
+    wait_user_ack(
+        state,
+        ErrorNotice {
+            kind,
+            code: code.to_string(),
+            name: name.to_string(),
+            detail: detail.to_string(),
+            hint,
+            links: source_verify_links(code, &["em"]),
+        },
+    )
+}
+
 /// 东财全市场抓取（对齐 Python crawl_market_em）。
 pub fn run_em_crawler(
     config: CrawlConfig,
@@ -465,21 +492,51 @@ pub fn run_em_crawler(
     let db = match Db::open(&config.db_path) {
         Ok(d) => d,
         Err(e) => {
+            let detail = format!("打开数据库失败: {e}");
+            let ack = wait_user_ack(
+                &state,
+                ErrorNotice {
+                    kind: "落库失败".into(),
+                    code: String::new(),
+                    name: "数据库".into(),
+                    detail: detail.clone(),
+                    hint: "检查 exe 旁的 market_data.db 路径是否可写，磁盘是否满。".into(),
+                    links: vec![],
+                },
+            );
             if let Ok(mut st) = state.lock() {
-                st.status = CrawlStatus::Error;
-                st.status_msg = format!("打开数据库失败: {e}");
+                st.status = if ack == UserAck::Stop {
+                    CrawlStatus::Stopped
+                } else {
+                    CrawlStatus::Error
+                };
+                st.status_msg = detail;
             }
             return;
         }
     };
 
-    let client = match Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout))
-        .build()
-    {
-        Ok(c) => c,
+    let client = match crate::http::build_blocking_client(config.timeout) {
+        Ok(c) => {
+            let px = crate::http::last_proxy_desc();
+            if px.is_empty() {
+                log("HTTP 客户端就绪（直连，未读到系统代理）");
+            } else {
+                log(&format!("HTTP 客户端就绪（代理 {px}）"));
+            }
+            c
+        }
         Err(e) => {
             log(&format!("HTTP 客户端失败: {e}"));
+            let ack = ask_em(&state, "", "HTTP客户端", &format!("网络错误: {e}"));
+            if let Ok(mut st) = state.lock() {
+                st.status = if ack == UserAck::Stop {
+                    CrawlStatus::Stopped
+                } else {
+                    CrawlStatus::Error
+                };
+                st.status_msg = e;
+            }
             return;
         }
     };
@@ -496,18 +553,19 @@ pub fn run_em_crawler(
         60.0,
     );
 
-    let raw = fetch_stocknew_all(
-        &client,
-        &mut limiter,
-        config.max_retries,
-        config.timeout,
-        &log,
-    );
-    let total = match config.limit {
-        Some(n) => raw.len().min(n),
-        None => raw.len(),
-    };
-    if raw.is_empty() {
+    let mut raw;
+    loop {
+        let (rows, page_fail) = fetch_stocknew_all(
+            &client,
+            &mut limiter,
+            config.max_retries,
+            config.timeout,
+            &log,
+        );
+        raw = rows;
+        if !raw.is_empty() {
+            break;
+        }
         let list_url = em_url(
             "RPT_DMSK_TS_STOCKNEW",
             &[
@@ -517,8 +575,38 @@ pub fn run_em_crawler(
                 ("sortTypes", "1".into()),
             ],
         );
-        log(&em_empty_hint(&list_url));
+        let mut detail = em_empty_hint(&list_url);
+        if let Some(e) = page_fail {
+            detail = format!("{e}\n{detail}");
+        }
+        log(&detail);
+        let kind = classify_kind(&detail);
+        let ack = wait_user_ack(
+            &state,
+            ErrorNotice {
+                kind,
+                code: String::new(),
+                name: "东财批量列表".into(),
+                detail,
+                hint: network_hint().into(),
+                links: source_verify_links("000001", &["em"]),
+            },
+        );
+        match ack {
+            UserAck::Retry => continue,
+            UserAck::Stop => {
+                if let Ok(mut st) = state.lock() {
+                    st.status = CrawlStatus::Stopped;
+                }
+                return;
+            }
+            UserAck::Continue => break,
+        }
     }
+    let total = match config.limit {
+        Some(n) => raw.len().min(n),
+        None => raw.len(),
+    };
     if let Ok(mut st) = state.lock() {
         st.total = total;
         st.status = CrawlStatus::Running;
@@ -709,6 +797,10 @@ pub fn run_em_crawler(
                     "落库失败 {code}: {e}；请打开源站核对: {}",
                     em_stock_page_url(&code)
                 ));
+                let ack = ask_em(&state, &code, &name, &format!("落库失败: {e}"));
+                if ack == UserAck::Stop {
+                    stop.store(true, Ordering::SeqCst);
+                }
             }
         }
 

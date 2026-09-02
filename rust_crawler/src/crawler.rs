@@ -5,14 +5,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use reqwest::blocking::Client;
-
 use crate::http::{crawl_one, RateLimiter};
 use crate::models::StockRef;
-use crate::state::{AppState, CrawlStatus};
+use crate::state::{wait_user_ack, AppState, CrawlStatus, ErrorNotice, UserAck};
 use crate::db;
 use crate::settings::Settings;
 use crate::checklist::{CheckList, CheckItem, CheckStatus};
+use crate::verify::{classify_kind, network_hint, source_verify_links};
 use chrono::Utc;
 
 #[derive(Clone)]
@@ -81,6 +80,32 @@ fn try_selenium_cookie_refresh(log: &dyn Fn(&str)) -> bool {
     }
 }
 
+fn ask_user(
+    state: &Arc<Mutex<AppState>>,
+    code: &str,
+    name: &str,
+    detail: &str,
+    sources: &[&str],
+) -> UserAck {
+    let kind = classify_kind(detail);
+    let hint = if kind == "网络错误" {
+        network_hint().to_string()
+    } else {
+        "未拿到不等于源站确认无数据。请打开源站，看页面上有没有对应内容、是否和本次结果一致。".into()
+    };
+    wait_user_ack(
+        state,
+        ErrorNotice {
+            kind,
+            code: code.to_string(),
+            name: name.to_string(),
+            detail: detail.to_string(),
+            hint,
+            links: source_verify_links(code, sources),
+        },
+    )
+}
+
 pub fn run_crawler(
     config: CrawlConfig,
     state: Arc<Mutex<AppState>>,
@@ -98,25 +123,56 @@ pub fn run_crawler(
     let mut db = match db::Db::open(&config.db_path) {
         Ok(d) => d,
         Err(e) => {
+            let detail = format!("打开数据库失败: {e}");
+            let ack = wait_user_ack(
+                &state,
+                ErrorNotice {
+                    kind: "落库失败".into(),
+                    code: String::new(),
+                    name: "数据库".into(),
+                    detail: detail.clone(),
+                    hint: "检查 exe 旁的 market_data.db 路径是否可写，磁盘是否满。".into(),
+                    links: vec![],
+                },
+            );
             if let Ok(mut st) = state.lock() {
-                st.status = CrawlStatus::Error;
-                st.status_msg = format!("打开数据库失败: {}", e);
+                st.status = if ack == UserAck::Stop {
+                    CrawlStatus::Stopped
+                } else {
+                    CrawlStatus::Error
+                };
+                st.status_msg = detail;
             }
             return;
         }
     };
 
-    // 单 HTTP 客户端（开启 cookie_store，①）：整轮抓取复用
-    let client = match Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout))
-        .cookie_store(true)
-        .build()
-    {
-        Ok(c) => c,
+    // 单 HTTP 客户端：走系统代理 + cookie 仓（新电脑不走代理会整表网络错误）
+    let client = match crate::http::build_blocking_client(config.timeout) {
+        Ok(c) => {
+            let px = crate::http::last_proxy_desc();
+            if px.is_empty() {
+                log("HTTP 客户端就绪（直连，未读到系统代理）");
+            } else {
+                log(&format!("HTTP 客户端就绪（代理 {px}）"));
+            }
+            c
+        }
         Err(e) => {
             log(&format!("HTTP 客户端创建失败: {}", e));
+            let ack = ask_user(
+                &state,
+                "",
+                "HTTP客户端",
+                &format!("网络错误: {e}"),
+                &["baidu"],
+            );
             if let Ok(mut st) = state.lock() {
-                st.status = CrawlStatus::Error;
+                st.status = if ack == UserAck::Stop {
+                    CrawlStatus::Stopped
+                } else {
+                    CrawlStatus::Error
+                };
                 st.status_msg = e.to_string();
             }
             return;
@@ -225,107 +281,182 @@ pub fn run_crawler(
 
         let single_start = Instant::now();
         let stock = StockRef { code: code.clone(), name: name.clone() };
-        let res = crawl_one(&client, &mut limiter, &stock, &config, &state);
 
-        match res {
-            Ok(parsed) => {
-                if let Err(e) = db.save_snapshot(&config.trade_date, &stock, &parsed) {
-                    failed += 1;
-                    let _ = db.bump_crawl_stats(&code, false, "fail");
-                    log(&format!("保存失败 {}: {}", code, e));
-                } else {
-                    done += 1;
-                    consecutive_403 = 0;
-                    // —— 逐股即时完整性校验（只读 SELECT，不改库；异常写入清单 + 日志）——
-                    if settings.check.check_after_each_stock {
-                        match db.completeness(&config.trade_date, &code) {
-                            Ok(c) => {
-                                let missing = c.missing_vec();
-                                let n = missing.len();
-                                if n >= settings.check.missing_count_threshold {
-                                    log(&format!(
-                                        "⚠ [完整性] {} ({}) 缺 {} 项: {:?}",
-                                        code, name, n, missing
-                                    ));
-                                    let prev = checklist.items.iter().find(|i| i.code == code);
-                                    let tries = prev.map(|i| i.tries).unwrap_or(0);
-                                    let last_try = prev.and_then(|i| i.last_try.clone());
-                                    let status = if tries >= settings.rescrape.max_tries {
-                                        CheckStatus::Exhausted
-                                    } else {
-                                        CheckStatus::Pending
-                                    };
-                                    checklist.upsert(CheckItem {
-                                        code: code.clone(),
-                                        name: name.clone(),
-                                        missing,
-                                        missing_count: n,
-                                        tries,
-                                        last_try,
-                                        status,
-                                    });
-                                }
+        // 出错必须弹窗确认或打开源站；选「重试」则本只再抓一次
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let res = crawl_one(&client, &mut limiter, &stock, &config, &state);
+            match res {
+                Ok(parsed) => {
+                    let empty = parsed.scores.update_time.is_none();
+                    if empty {
+                        let ack = ask_user(
+                            &state,
+                            &code,
+                            &name,
+                            "本次未拿到数据（待人工确认，不是确认无数据）",
+                            &["baidu"],
+                        );
+                        match ack {
+                            UserAck::Retry => continue,
+                            UserAck::Stop => {
+                                stop.store(true, Ordering::SeqCst);
+                                break;
                             }
-                            Err(e) => log(&format!("完整性检查失败 {}: {}", code, e)),
+                            UserAck::Continue => {}
                         }
                     }
-                }
-            }
-            Err(e) => {
-                failed += 1;
-                let _ = db.bump_crawl_stats(&code, false, "fail");
-                let msg = e.clone();
-                log(&format!("股票 {} 抓取失败: {}", code, e));
-                if msg.contains("403") || msg.contains("Forbidden") || msg.contains("CHALLENGE") {
-                    consecutive_403 += 1;
-                    if consecutive_403 >= CONSEC_403_THRESHOLD {
-                        cooldown_count += 1;
-                        if cooldown_count > MAX_COOLDOWNS {
-                            if let Ok(mut st) = state.lock() {
-                                st.status = CrawlStatus::Error;
-                                st.status_msg = format!(
-                                    "连续冷却 {} 次仍遭 403，判定为持久封禁，停止。已完成 {} 跳过 {} 失败 {}",
-                                    MAX_COOLDOWNS, done, skipped, failed
-                                );
+                    if let Err(e) = db.save_snapshot(&config.trade_date, &stock, &parsed) {
+                        let ack = ask_user(
+                            &state,
+                            &code,
+                            &name,
+                            &format!("保存失败: {e}"),
+                            &["baidu"],
+                        );
+                        match ack {
+                            UserAck::Retry => continue,
+                            UserAck::Stop => {
+                                stop.store(true, Ordering::SeqCst);
+                                break;
                             }
+                            UserAck::Continue => {
+                                failed += 1;
+                                let _ = db.bump_crawl_stats(&code, false, "fail");
+                            }
+                        }
+                    } else {
+                        done += 1;
+                        consecutive_403 = 0;
+                        if settings.check.check_after_each_stock {
+                            match db.completeness(&config.trade_date, &code) {
+                                Ok(c) => {
+                                    let missing = c.missing_vec();
+                                    let n = missing.len();
+                                    if n >= settings.check.missing_count_threshold {
+                                        let detail = format!(
+                                            "完整性缺 {} 项: {:?}",
+                                            n, missing
+                                        );
+                                        log(&format!("⚠ [完整性] {} ({}) {}", code, name, detail));
+                                        let prev = checklist.items.iter().find(|i| i.code == code);
+                                        let tries = prev.map(|i| i.tries).unwrap_or(0);
+                                        let last_try = prev.and_then(|i| i.last_try.clone());
+                                        let status = if tries >= settings.rescrape.max_tries {
+                                            CheckStatus::Exhausted
+                                        } else {
+                                            CheckStatus::Pending
+                                        };
+                                        checklist.upsert(CheckItem {
+                                            code: code.clone(),
+                                            name: name.clone(),
+                                            missing: missing.clone(),
+                                            missing_count: n,
+                                            tries,
+                                            last_try,
+                                            status,
+                                        });
+                                        let ack = ask_user(&state, &code, &name, &detail, &["baidu"]);
+                                        match ack {
+                                            UserAck::Retry => continue,
+                                            UserAck::Stop => {
+                                                stop.store(true, Ordering::SeqCst);
+                                                break;
+                                            }
+                                            UserAck::Continue => {}
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let ack = ask_user(
+                                        &state,
+                                        &code,
+                                        &name,
+                                        &format!("完整性检查失败: {e}"),
+                                        &["baidu"],
+                                    );
+                                    if ack == UserAck::Stop {
+                                        stop.store(true, Ordering::SeqCst);
+                                    } else if ack == UserAck::Retry {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                Err(e) => {
+                    let msg = e.clone();
+                    log(&format!("股票 {} 抓取失败: {}", code, e));
+                    let ack = ask_user(&state, &code, &name, &msg, &["baidu"]);
+                    match ack {
+                        UserAck::Retry => continue,
+                        UserAck::Stop => {
+                            stop.store(true, Ordering::SeqCst);
                             break;
                         }
-                        if let Ok(mut st) = state.lock() {
-                            st.status = CrawlStatus::Cooling;
-                            st.status_msg = format!(
-                                "连续 {} 支遭 403，C→B Selenium headless 刷新 Cookie (第 {}/{})",
-                                consecutive_403, cooldown_count, MAX_COOLDOWNS
-                            );
-                            st.consecutive_403 = consecutive_403;
-                        }
-                        log("C 方案失效，切换 B 方案（调用 Python Selenium headless 刷新 Cookie）");
-                        let refreshed = try_selenium_cookie_refresh(&log);
-                        if refreshed {
-                            log("[B] Cookie 已刷新，5 秒后继续");
-                            std::thread::sleep(std::time::Duration::from_secs(5));
-                        } else {
-                            log(&format!("[B] 刷新失败，回退冷却 {:.0}s", COOLDOWN_SEC));
-                            let mut remaining = COOLDOWN_SEC;
-                            while remaining > 0.0 {
-                                if stop.load(Ordering::SeqCst) {
-                                    break;
-                                }
-                                let step = remaining.min(1.0);
-                                std::thread::sleep(std::time::Duration::from_secs_f64(step));
-                                remaining -= step;
+                        UserAck::Continue => {}
+                    }
+                    failed += 1;
+                    let _ = db.bump_crawl_stats(&code, false, "fail");
+                    if msg.contains("403") || msg.contains("Forbidden") || msg.contains("CHALLENGE") {
+                        consecutive_403 += 1;
+                        if consecutive_403 >= CONSEC_403_THRESHOLD {
+                            cooldown_count += 1;
+                            if cooldown_count > MAX_COOLDOWNS {
                                 if let Ok(mut st) = state.lock() {
-                                    st.cooldown_remaining = remaining;
+                                    st.status = CrawlStatus::Error;
+                                    st.status_msg = format!(
+                                        "连续冷却 {} 次仍遭 403，判定为持久封禁，停止。已完成 {} 跳过 {} 失败 {}",
+                                        MAX_COOLDOWNS, done, skipped, failed
+                                    );
+                                }
+                                stop.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            if let Ok(mut st) = state.lock() {
+                                st.status = CrawlStatus::Cooling;
+                                st.status_msg = format!(
+                                    "连续 {} 支遭 403，C→B Selenium headless 刷新 Cookie (第 {}/{})",
+                                    consecutive_403, cooldown_count, MAX_COOLDOWNS
+                                );
+                                st.consecutive_403 = consecutive_403;
+                            }
+                            log("C 方案失效，切换 B 方案（调用 Python Selenium headless 刷新 Cookie）");
+                            let refreshed = try_selenium_cookie_refresh(&log);
+                            if refreshed {
+                                log("[B] Cookie 已刷新，5 秒后继续");
+                                std::thread::sleep(std::time::Duration::from_secs(5));
+                            } else {
+                                log(&format!("[B] 刷新失败，回退冷却 {:.0}s", COOLDOWN_SEC));
+                                let mut remaining = COOLDOWN_SEC;
+                                while remaining > 0.0 {
+                                    if stop.load(Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    let step = remaining.min(1.0);
+                                    std::thread::sleep(std::time::Duration::from_secs_f64(step));
+                                    remaining -= step;
+                                    if let Ok(mut st) = state.lock() {
+                                        st.cooldown_remaining = remaining;
+                                    }
+                                }
+                            }
+                            consecutive_403 = 0;
+                            if let Ok(mut st) = state.lock() {
+                                st.cooldown_remaining = 0.0;
+                                if !stop.load(Ordering::SeqCst) {
+                                    st.status = CrawlStatus::Running;
                                 }
                             }
                         }
+                    } else {
                         consecutive_403 = 0;
-                        if let Ok(mut st) = state.lock() {
-                            st.cooldown_remaining = 0.0;
-                            st.status = CrawlStatus::Running;
-                        }
                     }
-                } else {
-                    consecutive_403 = 0;
+                    break;
                 }
             }
         }

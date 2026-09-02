@@ -13,6 +13,7 @@ mod state;
 mod settings;
 mod checklist;
 mod em_crawler;
+mod verify;
 
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -28,10 +29,11 @@ use eframe::egui;
 use crate::crawler::{CrawlConfig, run_crawler};
 use crate::em_crawler::run_em_crawler;
 use crate::models::StockRef;
-use crate::state::{AppState, CrawlStatus};
+use crate::state::{submit_ack, wait_user_ack, AppState, CrawlStatus, ErrorNotice, UserAck};
 use crate::db::Db;
 use crate::settings::Settings;
 use crate::checklist::{CheckList, CheckItem, CheckStatus};
+use crate::verify::{baidu_analysis_api_url, network_hint, source_verify_links};
 
 /// 内置 A 股代码清单（5532 支，编译期嵌入）。
 const EMBEDDED_CODES: &str = include_str!("../assets/a_stocks.json");
@@ -93,6 +95,10 @@ struct CrawlerApp {
     rescrape_thread: Option<thread::JoinHandle<()>>,
     /// 首帧强制最大化（部分 Windows/egui 组合下仅 with_maximized 不够）。
     did_maximize: bool,
+    /// 弹窗「同样原因本轮不再问」勾选。
+    mute_same_kind: bool,
+    /// 启动后只做一次网络探测。
+    did_net_probe: bool,
 }
 
 impl Default for CrawlerApp {
@@ -131,6 +137,8 @@ impl Default for CrawlerApp {
             check_thread: None,
             rescrape_thread: None,
             did_maximize: false,
+            mute_same_kind: false,
+            did_net_probe: false,
         }
     }
 }
@@ -441,6 +449,7 @@ fn status_badge(ui: &mut egui::Ui, status: &CrawlStatus) {
         CrawlStatus::Idle => ("空闲", MUTED),
         CrawlStatus::Running => ("运行中", ACCENT),
         CrawlStatus::Cooling => ("冷却中", WARN),
+        CrawlStatus::NeedConfirm => ("待确认", DANGER),
         CrawlStatus::Done => ("已完成", OK),
         CrawlStatus::Stopped => ("已停止", MUTED),
         CrawlStatus::Error => ("错误", DANGER),
@@ -499,36 +508,56 @@ impl CrawlerApp {
         if !finished {
             return;
         }
+        if let Ok(g) = self.state.lock() {
+            if g.pending_error.is_some() || matches!(g.status, CrawlStatus::NeedConfirm) {
+                return;
+            }
+        }
         let trade_date = self.trade_date_input.clone();
         if !self.force_input && !is_trading_day(&trade_date) {
-            if let Ok(mut g) = self.state.lock() {
-                g.status = CrawlStatus::Error;
-                g.status_msg = format!(
-                    "{} 非交易日，已阻止（勾选\"强制\"可忽略）",
-                    trade_date
-                );
-            }
+            popup_notice(
+                &self.state,
+                ErrorNotice {
+                    kind: "其它错误".into(),
+                    code: String::new(),
+                    name: trade_date.clone(),
+                    detail: format!("{} 非交易日，已阻止（勾选「强制」可忽略）", trade_date),
+                    hint: "休市日源站通常也没有当日数据。勾选「强制」后再点开始。".into(),
+                    links: vec![],
+                },
+            );
             return;
         }
         let codes = load_codes();
         if codes.is_empty() {
-            if let Ok(mut g) = self.state.lock() {
-                g.status = CrawlStatus::Error;
-                g.status_msg = "代码清单为空".into();
-            }
+            popup_notice(
+                &self.state,
+                ErrorNotice {
+                    kind: "其它错误".into(),
+                    code: String::new(),
+                    name: "代码清单".into(),
+                    detail: "代码清单为空".into(),
+                    hint: "内置 a_stocks.json 未能加载，请重新下载完整安装包。".into(),
+                    links: vec![],
+                },
+            );
             return;
         }
         if detect_python_running() && is_shared_db(&self.db_path_input) {
             let msg = kill_python_crawler();
             thread::sleep(Duration::from_secs(2));
             if detect_python_running() {
-                if let Ok(mut g) = self.state.lock() {
-                    g.status = CrawlStatus::Error;
-                    g.status_msg = format!(
-                        "{} 但 Python 仍在运行，已阻止启动（禁止并存）",
-                        msg
-                    );
-                }
+                popup_notice(
+                    &self.state,
+                    ErrorNotice {
+                        kind: "其它错误".into(),
+                        code: String::new(),
+                        name: "Python爬虫".into(),
+                        detail: format!("{} 但 Python 仍在运行，已阻止启动（禁止并存）", msg),
+                        hint: "请先关掉 Python 版爬虫窗口，再点开始。".into(),
+                        links: vec![],
+                    },
+                );
                 return;
             }
             self.existing_count = count_existing(&self.db_path_input, &trade_date);
@@ -550,6 +579,9 @@ impl CrawlerApp {
         let state = self.state.clone();
         let stop = self.stop_flag.clone();
         stop.store(false, Ordering::SeqCst);
+        if let Ok(mut g) = self.state.lock() {
+            g.mute_error_kinds.clear();
+        }
         let settings = crate::settings::Settings::load();
         let mut checklist =
             crate::checklist::CheckList::load_or_default(&settings.general.checklist_path);
@@ -563,7 +595,7 @@ impl CrawlerApp {
             max_per_minute: mp,
             jitter: 0.6,
             max_retries: 3,
-            timeout: 15,
+            timeout: 30,
             limit: None,
             resume,
             fresh_days: 2,
@@ -594,6 +626,110 @@ impl CrawlerApp {
         });
         self.crawler_thread = Some(handle);
     }
+
+    /// 出错弹窗：必须点确认/重试/停止；打开源站只开浏览器，不替你点确认。
+    fn show_error_dialog(&mut self, ctx: &egui::Context, notice: &ErrorNotice) {
+        let title = format!("请确认 · {}", notice.kind);
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.colored_label(
+                    DANGER,
+                    egui::RichText::new(&notice.kind).size(18.0).strong(),
+                );
+                if !notice.code.is_empty() || !notice.name.is_empty() {
+                    ui.colored_label(
+                        INK,
+                        egui::RichText::new(format!("{}  {}", notice.name, notice.code))
+                            .size(15.0)
+                            .strong(),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.label("未拿到 / 失败 ≠ 源站确认无数据。请打开下面链接，看页面上有没有对应内容、是否和本次结果一致。");
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .show(ui, |ui| {
+                        ui.colored_label(TXT, &notice.detail);
+                    });
+                if !notice.hint.is_empty() {
+                    ui.add_space(8.0);
+                    ui.colored_label(DIM, &notice.hint);
+                }
+                ui.add_space(10.0);
+                ui.colored_label(INK, egui::RichText::new("打开源站核对").strong());
+                ui.horizontal_wrapped(|ui| {
+                    if notice.links.is_empty() {
+                        ui.colored_label(DIM, "（本条没有可跳转的源站链接）");
+                    }
+                    for link in &notice.links {
+                        let text = format!("{} · {}", link.source, link.label);
+                        if ui.button(text).clicked() {
+                            if let Err(e) = webbrowser::open(&link.url) {
+                                if let Ok(mut g) = self.state.lock() {
+                                    g.push_log(format!("无法打开浏览器: {e}  {}", link.url));
+                                }
+                            }
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                for link in &notice.links {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(DIM, if link.kind == "page" { "页面" } else { "接口" });
+                        ui.monospace(&link.url);
+                    });
+                }
+                ui.add_space(10.0);
+                ui.checkbox(
+                    &mut self.mute_same_kind,
+                    "同样原因本轮不再弹出（仍会记失败，只是不问）",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("确认继续")
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(ACCENT),
+                        )
+                        .clicked()
+                    {
+                        submit_ack(&self.state, UserAck::Continue, self.mute_same_kind);
+                    }
+                    if ui.button("重试本只").clicked() {
+                        submit_ack(&self.state, UserAck::Retry, self.mute_same_kind);
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("停止抓取")
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(DANGER),
+                        )
+                        .clicked()
+                    {
+                        self.stop_flag.store(true, Ordering::SeqCst);
+                        submit_ack(&self.state, UserAck::Stop, false);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.colored_label(
+                    DIM,
+                    "点「打开源站」只打开浏览器，还需要再点确认/重试/停止，爬虫才会继续。",
+                );
+            });
+    }
 }
 
 impl App for CrawlerApp {
@@ -601,6 +737,10 @@ impl App for CrawlerApp {
         if !self.did_maximize {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             self.did_maximize = true;
+        }
+        if !self.did_net_probe {
+            self.did_net_probe = true;
+            spawn_startup_probe(self.state.clone());
         }
         apply_theme(ctx);
 
@@ -621,6 +761,7 @@ impl App for CrawlerApp {
             eta,
             avg,
             logs,
+            pending_error,
         ) = {
             let g = self.state.lock().unwrap();
             (
@@ -640,6 +781,7 @@ impl App for CrawlerApp {
                 g.eta_secs,
                 g.avg_per_stock,
                 g.logs.clone(),
+                g.pending_error.clone(),
             )
         };
 
@@ -661,7 +803,12 @@ impl App for CrawlerApp {
             .as_ref()
             .map(|h| !h.is_finished())
             .unwrap_or(false);
-        let is_busy = matches!(status, CrawlStatus::Running | CrawlStatus::Cooling);
+        let awaiting = pending_error.is_some()
+            || matches!(status, CrawlStatus::NeedConfirm);
+        let is_busy = matches!(
+            status,
+            CrawlStatus::Running | CrawlStatus::Cooling | CrawlStatus::NeedConfirm
+        );
 
         // —— 顶栏：产品名 + 状态 + 主操作 ——
         egui::TopBottomPanel::top("top_bar")
@@ -698,12 +845,17 @@ impl App for CrawlerApp {
                             .clicked()
                         {
                             self.stop_flag.store(true, Ordering::SeqCst);
+                            if pending_error.is_some() {
+                                submit_ack(&self.state, UserAck::Stop, false);
+                            }
                         }
                         ui.add_space(6.0);
                         if ui
-                            .add(
+                                .add(
                                 egui::Button::new(
-                                    egui::RichText::new(if is_busy {
+                                    egui::RichText::new(if awaiting {
+                                        "请先确认弹窗"
+                                    } else if is_busy {
                                         "抓取进行中…"
                                     } else {
                                         "开始抓取"
@@ -711,7 +863,12 @@ impl App for CrawlerApp {
                                     .color(egui::Color32::WHITE)
                                     .strong(),
                                 )
-                                .fill(ACCENT),
+                                .fill(if awaiting { WARN } else { ACCENT })
+                                .sense(if is_busy {
+                                    egui::Sense::hover()
+                                } else {
+                                    egui::Sense::click()
+                                }),
                             )
                             .clicked()
                         {
@@ -1038,8 +1195,128 @@ impl App for CrawlerApp {
                     });
             });
 
-        ctx.request_repaint_after(Duration::from_millis(150));
+        if let Some(notice) = pending_error.as_ref() {
+            self.show_error_dialog(ctx, notice);
+        }
+
+        if pending_error.is_some() {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
     }
+}
+
+/// 界面线程不能卡住等确认，所以丢到后台线程里走同一套弹窗。
+fn popup_notice(state: &Arc<Mutex<AppState>>, notice: ErrorNotice) {
+    let state = state.clone();
+    thread::spawn(move || {
+        let _ = wait_user_ack(&state, notice);
+    });
+}
+
+/// 启动后探测百度/东财是否通；新电脑防火墙/代理问题会在这里先弹出来。
+fn spawn_startup_probe(state: Arc<Mutex<AppState>>) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500));
+        if let Ok(g) = state.lock() {
+            if !matches!(g.status, CrawlStatus::Idle) {
+                return;
+            }
+        }
+        let client = match crate::http::build_blocking_client(25) {
+            Ok(c) => c,
+            Err(e) => {
+                if let Ok(g) = state.lock() {
+                    if !matches!(g.status, CrawlStatus::Idle) {
+                        return;
+                    }
+                }
+                let _ = wait_user_ack(
+                    &state,
+                    ErrorNotice {
+                        kind: "网络错误".into(),
+                        code: String::new(),
+                        name: "启动探测".into(),
+                        detail: format!("HTTP 客户端创建失败: {e}"),
+                        hint: network_hint().into(),
+                        links: source_verify_links("000001", &["baidu", "em"]),
+                    },
+                );
+                return;
+            }
+        };
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+        let checks: [(&str, String, Vec<crate::verify::VerifyLink>); 3] = [
+            (
+                "百度财经首页",
+                "https://finance.baidu.com/".into(),
+                source_verify_links("000001", &["baidu"]),
+            ),
+            (
+                "百度分析接口",
+                baidu_analysis_api_url("000001"),
+                source_verify_links("000001", &["baidu"]),
+            ),
+            (
+                "东财千股千评",
+                "https://data.eastmoney.com/stockcomment/".into(),
+                source_verify_links("000001", &["em"]),
+            ),
+        ];
+        let mut fails: Vec<String> = Vec::new();
+        let mut links = Vec::new();
+        for (name, url, ln) in &checks {
+            match client
+                .get(url)
+                .header(reqwest::header::USER_AGENT, ua)
+                .send()
+            {
+                Ok(resp) => {
+                    let code = resp.status().as_u16();
+                    // 403/401 说明已经连上（多半是 Cookie），不算「网络错误」
+                    if code >= 500 || code == 0 {
+                        fails.push(format!("{name} HTTP {code}\n{url}"));
+                        links.extend(ln.clone());
+                    }
+                }
+                Err(e) => {
+                    fails.push(format!(
+                        "{name} 网络错误: {e}{}",
+                        crate::http::proxy_hint_suffix()
+                    ));
+                    links.extend(ln.clone());
+                }
+            }
+        }
+        if fails.is_empty() {
+            if let Ok(mut g) = state.lock() {
+                let px = crate::http::last_proxy_desc();
+                if px.is_empty() {
+                    g.push_log("启动探测：百度财经 / 东财网络可达（直连）".into());
+                } else {
+                    g.push_log(format!("启动探测：百度财经 / 东财网络可达（代理 {px}）"));
+                }
+            }
+            return;
+        }
+        if let Ok(g) = state.lock() {
+            if !matches!(g.status, CrawlStatus::Idle) {
+                return;
+            }
+        }
+        let _ = wait_user_ack(
+            &state,
+            ErrorNotice {
+                kind: "网络错误".into(),
+                code: String::new(),
+                name: "启动探测".into(),
+                detail: fails.join("\n\n"),
+                hint: network_hint().into(),
+                links,
+            },
+        );
+    });
 }
 
 /// 追加一行到日志文件（windows 子系统无控制台，不能用 println）。
@@ -1091,7 +1368,7 @@ fn run_headless(args: &[String], settings: &crate::settings::Settings) {
     let config = CrawlConfig {
         db_path, trade_date, codes,
         min_interval, max_per_minute, jitter: 0.6,
-        max_retries: 3, timeout: 15, limit,
+        max_retries: 3, timeout: 30, limit,
         resume: true, fresh_days: 2,
         empty_limit: 3, empty_cooldown_days: 7, rate_wait_cap: Some(15.0),
     };
@@ -1145,6 +1422,17 @@ fn run_check(settings: &Settings, state: Arc<Mutex<AppState>>) {
         Ok(d) => d,
         Err(e) => {
             log(&format!("[check] 打开数据库失败: {}", e));
+            let _ = wait_user_ack(
+                &state,
+                ErrorNotice {
+                    kind: "落库失败".into(),
+                    code: String::new(),
+                    name: "完整性检查".into(),
+                    detail: format!("打开数据库失败: {e}"),
+                    hint: "检查数据库路径是否存在、是否被其它程序占用。".into(),
+                    links: vec![],
+                },
+            );
             if let Ok(mut st) = state.lock() {
                 st.status = CrawlStatus::Error;
                 st.status_msg = format!("检查失败: {}", e);
@@ -1218,6 +1506,17 @@ fn run_check(settings: &Settings, state: Arc<Mutex<AppState>>) {
     checklist.updated_at = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     if let Err(e) = checklist.save(&settings.general.checklist_path) {
         log(&format!("[check] 写清单失败: {}", e));
+        let _ = wait_user_ack(
+            &state,
+            ErrorNotice {
+                kind: "落库失败".into(),
+                code: String::new(),
+                name: "待核查清单".into(),
+                detail: format!("写清单失败: {e}"),
+                hint: "检查 needed_check_list.json 路径是否可写。".into(),
+                links: vec![],
+            },
+        );
     }
     log(&format!(
         "[check] 结束: 扫描 {} 支, 异常 {} 支 -> {}",
@@ -1327,7 +1626,7 @@ fn run_rescrape(settings: &Settings, state: Arc<Mutex<AppState>>, stop: Arc<Atom
                 max_per_minute: 40,
                 jitter: 0.6,
                 max_retries: 3,
-                timeout: 15,
+                timeout: 30,
                 limit: Some(1),
                 resume: false,
                 fresh_days: 2,
@@ -1335,9 +1634,15 @@ fn run_rescrape(settings: &Settings, state: Arc<Mutex<AppState>>, stop: Arc<Atom
                 empty_cooldown_days: 0,
                 rate_wait_cap: Some(15.0),
             };
-            let st = Arc::new(Mutex::new(AppState::default()));
-            let stp = Arc::new(AtomicBool::new(false));
+            let st = state.clone();
+            let stp = stop.clone();
             run_crawler(cfg, st, stp, settings, &mut checklist);
+            if let Ok(mut g) = state.lock() {
+                if !matches!(g.status, CrawlStatus::Stopped) {
+                    g.status = CrawlStatus::Running;
+                    g.status_msg = "回填重抓中…".into();
+                }
+            }
 
             // 重抓后重新计算完整性
             match Db::open(&db_path).and_then(|d| d.completeness(&trade_date, code)) {
