@@ -149,16 +149,9 @@ def refresh_cookies_headless(timeout_page: float = 8.0) -> Optional[dict]:
 
 
 def apply_cookies_to_runtime(cookies: dict) -> None:
-    """把新 Cookie 写入 cookie 池，并同步到本进程环境变量（供后续子逻辑读取）。"""
+    """Cookie 写入 json；exe 读 baidu_cookies.json，不依赖 Cookie 池模块。"""
     if not cookies:
         return
-    try:
-        from baidu_cookie_pool import get_cookie_pool
-        pool = get_cookie_pool()
-        pool.add_manual_cookies(cookies)
-        logger.info("[B/Selenium] 已写入 Cookie 池")
-    except Exception as e:
-        logger.warning("[B/Selenium] 写入 Cookie 池失败: %s", e)
     os.environ["_BAIDU_COOKIE_DICT"] = json.dumps(cookies, ensure_ascii=False)
 
 

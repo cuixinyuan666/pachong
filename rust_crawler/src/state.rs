@@ -1,8 +1,12 @@
 //! GUI 与爬虫线程共享的进度状态（当时当下写入，UI 150ms 刷一次）。
+//! 会话日志：每一行都追加到 exe 旁 logs/session-日期.log，不截断、不覆盖。
 
 use std::collections::HashSet;
+use std::fs::{create_dir_all, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::verify::VerifyLink;
 
@@ -96,7 +100,7 @@ impl Default for AppState {
             total_elapsed: 0.0,
             eta_secs: 0.0,
             avg_per_stock: 0.0,
-            logs: Vec::new(),
+            logs: load_today_session_logs(),
             pending_error: None,
             error_ack_tx: None,
             mute_error_kinds: HashSet::new(),
@@ -107,15 +111,62 @@ impl Default for AppState {
 }
 
 impl AppState {
-    /// 追加一行会话日志，最多保留 800 行以免内存涨。
+    /// 追加一行会话日志：界面保留全文，同时写入 logs/session-日期.log。
     pub fn push_log(&mut self, line: String) {
-        self.logs.push(line);
-        if self.logs.len() > 800 {
-            let extra = self.logs.len() - 800;
-            self.logs.drain(0..extra);
-        }
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let stamped = format!("[{ts}] {line}");
+        append_session_log(&stamped);
+        self.logs.push(stamped);
     }
 }
+
+pub fn session_log_dir() -> PathBuf {
+    PathBuf::from(crate::settings::workspace_dir()).join("logs")
+}
+
+pub fn session_log_path() -> PathBuf {
+    let day = chrono::Local::now().format("%Y-%m-%d");
+    session_log_dir().join(format!("session-{day}.log"))
+}
+
+fn load_today_session_logs() -> Vec<String> {
+    match std::fs::read_to_string(session_log_path()) {
+        Ok(s) => s.lines().map(|l| l.to_string()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn append_session_log(line: &str) {
+    let _ = (|| -> std::io::Result<()> {
+        create_dir_all(session_log_dir())?;
+        let mut f = SESSION_FILE
+            .get_or_init(|| {
+                Mutex::new(
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(session_log_path())
+                        .ok(),
+                )
+            })
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "log lock"))?;
+        if f.is_none() {
+            *f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(session_log_path())
+                .ok();
+        }
+        if let Some(file) = f.as_mut() {
+            writeln!(file, "{line}")?;
+            file.flush()?;
+        }
+        Ok(())
+    })();
+}
+
+static SESSION_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 
 /// 出错后卡住爬虫线程，直到界面弹窗里点了确认/重试/停止。
 pub fn wait_user_ack(state: &Arc<Mutex<AppState>>, notice: ErrorNotice) -> UserAck {
@@ -208,9 +259,5 @@ pub fn note_problem(
             page_url,
             page_label,
         });
-        if g.problems.len() > 500 {
-            let extra = g.problems.len() - 500;
-            g.problems.drain(0..extra);
-        }
     }
 }

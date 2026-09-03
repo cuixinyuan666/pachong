@@ -441,6 +441,7 @@ pub fn run_crawler(
         db,
         exits,
         targets,
+        false,
     );
 
     if let Ok(mut st) = state.lock() {
@@ -485,6 +486,7 @@ fn crawl_baidu_parallel(
     db: db::Db,
     exits: crate::http::ExitClients,
     targets: Vec<StockRef>,
+    retry_pass: bool,
 ) -> (usize, usize, usize) {
     let log = |s: &str| {
         if let Ok(mut st) = state.lock() {
@@ -509,7 +511,7 @@ fn crawl_baidu_parallel(
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            if config.resume {
+            if config.resume && !retry_pass {
                 match dbg.should_skip(
                     &item.code,
                     "baidu",
@@ -550,6 +552,7 @@ fn crawl_baidu_parallel(
     let queue = Arc::new(Mutex::new(todo));
     let done_n = Arc::new(AtomicUsize::new(0));
     let fail_n = Arc::new(AtomicUsize::new(0));
+    let failed_stocks = Arc::new(Mutex::new(Vec::<StockRef>::new()));
     let t0 = Instant::now();
     let now0 = Instant::now();
     let pace = Arc::new(Mutex::new(Pace {
@@ -594,6 +597,7 @@ fn crawl_baidu_parallel(
         let cl = cl.clone();
         let done_n = done_n.clone();
         let fail_n = fail_n.clone();
+        let failed_stocks = failed_stocks.clone();
         let pace = pace.clone();
         let state = state.clone();
         let stop = stop.clone();
@@ -663,6 +667,9 @@ fn crawl_baidu_parallel(
                         };
                         if !save_ok {
                             fail_n.fetch_add(1, Ordering::SeqCst);
+                            if let Ok(mut f) = failed_stocks.lock() {
+                                f.push(stock.clone());
+                            }
                         } else {
                             done_n.fetch_add(1, Ordering::SeqCst);
                             if let Ok(mut p) = pace.lock() {
@@ -749,6 +756,9 @@ fn crawl_baidu_parallel(
                         }
                         note_problem(&state, "抓取失败", &code, &name, &msg, &["baidu"]);
                         fail_n.fetch_add(1, Ordering::SeqCst);
+                        if let Ok(mut f) = failed_stocks.lock() {
+                            f.push(stock.clone());
+                        }
                         if let Ok(dbg) = db.lock() {
                             let _ = dbg.bump_crawl_stats(&code, false, "fail");
                         }
@@ -791,11 +801,35 @@ fn crawl_baidu_parallel(
     if let Ok(g) = cl.lock() {
         *checklist = g.clone();
     }
-    (
-        done_n.load(Ordering::SeqCst),
-        skipped,
-        fail_n.load(Ordering::SeqCst),
-    )
+    let done = done_n.load(Ordering::SeqCst);
+    let failed = fail_n.load(Ordering::SeqCst);
+    let retry_list = failed_stocks
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
+    if !retry_pass && !retry_list.is_empty() && !stop.load(Ordering::SeqCst) {
+        log(&format!(
+            "本轮失败 {} 只，自动补抓一遍（网络抖动/偶发超时）",
+            retry_list.len()
+        ));
+        if let Ok(db_mu) = Arc::try_unwrap(db) {
+            let db_owned = db_mu.into_inner().unwrap_or_else(|p| p.into_inner());
+            let (d2, _, f2) = crawl_baidu_parallel(
+                config,
+                state,
+                stop,
+                settings,
+                checklist,
+                db_owned,
+                exits.clone(),
+                retry_list,
+                true,
+            );
+            return (done + d2, skipped, f2);
+        }
+        log("补抓未能拿到数据库锁，失败的下次点「继续」会重爬");
+    }
+    (done, skipped, failed)
 }
 
 fn handle_403(

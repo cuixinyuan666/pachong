@@ -127,8 +127,15 @@ impl Default for CrawlerApp {
         // 启动即检测：该日期是否已抓取过多少、Python 是否在跑。
         let existing_count = count_existing(&db_path, &default_date);
         let python_running = detect_python_running();
+        let state = Arc::new(Mutex::new(AppState::default()));
+        if let Ok(mut g) = state.lock() {
+            g.push_log(format!(
+                "会话日志完整写入 {}（按日追加，不截断）",
+                crate::state::session_log_path().display()
+            ));
+        }
         Self {
-            state: Arc::new(Mutex::new(AppState::default())),
+            state,
             stop_flag: Arc::new(AtomicBool::new(false)),
             crawler_thread: None,
             trade_date_input: default_date,
@@ -261,63 +268,6 @@ fn kill_python_crawler() -> String {
             }
         }
         Err(e) => format!("停止失败: {}", e),
-    }
-}
-
-/// 对齐 Web：用同目录 Python 脚本抓东财/百度（限流参数可自定义）。
-fn spawn_python_crawler(
-    script_name: &str,
-    db_path: &str,
-    min_interval: &str,
-    max_per_minute: &str,
-    state: Arc<Mutex<AppState>>,
-) {
-    let py = std::env::var("PYTHON").unwrap_or_else(|_| "python".to_string());
-    let script = format!("{}/{}", crate::settings::workspace_dir(), script_name);
-    let mi = min_interval.parse::<f64>().unwrap_or(1.0);
-    let mpm = max_per_minute.parse::<usize>().unwrap_or(40);
-    if let Ok(mut g) = state.lock() {
-        g.push_log(format!(
-            "启动 Python {} --market --db {} --min-interval {} --max-per-minute {}",
-            script_name, db_path, mi, mpm
-        ));
-        g.status = CrawlStatus::Running;
-        g.status_msg = format!("Python {}", script_name);
-    }
-    let out = std::process::Command::new(&py)
-        .creation_flags(0x08000000)
-        .args([
-            "-u",
-            &script,
-            "--market",
-            "--progress-log",
-            "--db",
-            db_path,
-            "--min-interval",
-            &format!("{}", mi),
-            "--max-per-minute",
-            &format!("{}", mpm),
-        ])
-        .current_dir(crate::settings::workspace_dir())
-        .output();
-    match out {
-        Ok(o) => {
-            let code = o.status.code().unwrap_or(-1);
-            let tail = String::from_utf8_lossy(&o.stdout);
-            let last = tail.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
-            if let Ok(mut g) = state.lock() {
-                g.push_log(format!("Python {} 退出码 {} {}", script_name, code, last));
-                g.status = if code == 0 { CrawlStatus::Done } else { CrawlStatus::Error };
-                g.status_msg = format!("{} 退出 {}", script_name, code);
-            }
-        }
-        Err(e) => {
-            if let Ok(mut g) = state.lock() {
-                g.push_log(format!("启动 Python 失败: {}", e));
-                g.status = CrawlStatus::Error;
-                g.status_msg = e.to_string();
-            }
-        }
     }
 }
 
@@ -623,7 +573,13 @@ impl CrawlerApp {
             rate_wait_cap: rate_cap,
         };
         let handle = thread::spawn(move || match source_mode {
-            1 => run_em_crawler(config, state, stop, &settings),
+            1 => {
+                let mut em_cfg = config;
+                em_cfg.min_interval = 0.05;
+                em_cfg.max_per_minute = 800;
+                em_cfg.jitter = 0.0;
+                run_em_crawler(em_cfg, state, stop, &settings);
+            }
             2 => {
                 run_crawler(
                     config.clone(),
@@ -636,8 +592,8 @@ impl CrawlerApp {
                     return;
                 }
                 let mut em_cfg = config;
-                em_cfg.min_interval = 0.1;
-                em_cfg.max_per_minute = 200;
+                em_cfg.min_interval = 0.05;
+                em_cfg.max_per_minute = 800;
                 em_cfg.jitter = 0.0;
                 run_em_crawler(em_cfg, state, stop, &settings);
             }
@@ -806,6 +762,7 @@ impl App for CrawlerApp {
             eta,
             avg,
             logs,
+            log_total,
             pending_error,
             problems,
         ) = {
@@ -826,7 +783,15 @@ impl App for CrawlerApp {
                 g.total_elapsed,
                 g.eta_secs,
                 g.avg_per_stock,
-                g.logs.clone(),
+                {
+                    let n = g.logs.len();
+                    if n > 4000 {
+                        g.logs[n - 4000..].to_vec()
+                    } else {
+                        g.logs.clone()
+                    }
+                },
+                g.logs.len(),
                 g.pending_error.clone(),
                 g.problems.clone(),
             )
@@ -939,7 +904,22 @@ impl App for CrawlerApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.colored_label(INK, egui::RichText::new("会话日志").size(12.0).strong());
-                    ui.colored_label(DIM, egui::RichText::new("实时输出 · 自动贴底").size(11.0));
+                    ui.colored_label(
+                        DIM,
+                        egui::RichText::new(format!("共 {log_total} 行 · 完整文件不删除")).size(11.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("打开日志目录").clicked() {
+                            let dir = crate::state::session_log_dir();
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                        }
+                        if ui.button("复制全部").clicked() {
+                            let text = std::fs::read_to_string(crate::state::session_log_path())
+                                .unwrap_or_else(|_| logs.join("\n"));
+                            ui.ctx().copy_text(text);
+                        }
+                    });
                 });
                 ui.add_space(4.0);
                 egui::Frame::none()
@@ -1246,53 +1226,6 @@ impl App for CrawlerApp {
                                 DIM,
                                 "检查写入清单；回填对缺失股强制补齐",
                             );
-                            ui.add_space(4.0);
-                            ui.colored_label(DIM, "可选：对齐 Web 的 Python 脚本");
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.button("仅东财(Py)").clicked() {
-                                    let db = self.db_path_input.clone();
-                                    let mi = self.min_interval_input.clone();
-                                    let mpm = self.max_per_minute_input.clone();
-                                    let state = self.state.clone();
-                                    thread::spawn(move || {
-                                        spawn_python_crawler(
-                                            "eastmoney_stockcomment_crawler.py",
-                                            &db,
-                                            &mi,
-                                            &mpm,
-                                            state,
-                                        );
-                                    });
-                                }
-                                if ui.button("一键百度+东财(Py)").clicked() {
-                                    let db = self.db_path_input.clone();
-                                    let mi = self.min_interval_input.clone();
-                                    let mpm = self.max_per_minute_input.clone();
-                                    let state = self.state.clone();
-                                    thread::spawn(move || {
-                                        if let Ok(mut g) = state.lock() {
-                                            g.push_log("一键：启动 Python 百度全市场…".into());
-                                        }
-                                        spawn_python_crawler(
-                                            "baidu_finance_ai_crawler.py",
-                                            &db,
-                                            &mi,
-                                            &mpm,
-                                            state.clone(),
-                                        );
-                                        if let Ok(mut g) = state.lock() {
-                                            g.push_log("一键：启动 Python 东财全市场…".into());
-                                        }
-                                        spawn_python_crawler(
-                                            "eastmoney_stockcomment_crawler.py",
-                                            &db,
-                                            &mi,
-                                            &mpm,
-                                            state,
-                                        );
-                                    });
-                                }
-                            });
                         });
                     });
             });
