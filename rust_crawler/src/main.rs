@@ -1048,9 +1048,12 @@ impl CrawlerApp {
 
         let row_h = 28.0;
         let n = board.rows.len();
+        // 用主区剩余固定高度，避免 max_height=∞ 时列表撑满全量行、滚轮无效。
+        let list_h = (ui.max_rect().bottom() - ui.cursor().top() - 6.0).max(160.0);
         egui::ScrollArea::vertical()
             .id_salt("rank_rows")
-            .max_height(ui.available_height().max(240.0))
+            .auto_shrink([false, false])
+            .max_height(list_h)
             .show_rows(ui, row_h, n, |ui, range| {
                 for i in range {
                     let row = &board.rows[i];
@@ -1818,16 +1821,19 @@ impl App for CrawlerApp {
                 });
                 ui.add_space(10.0);
                 if self.main_tab == 1 {
-                    if self.lookup_page == LookupPage::Rank {
-                        self.ui_stock_lookup(ui);
-                    } else {
-                        egui::ScrollArea::vertical()
-                            .id_salt("lookup_scroll")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                self.ui_stock_lookup(ui);
-                            });
-                    }
+                    let body = ui.available_size();
+                    ui.allocate_ui(body, |ui| {
+                        if self.lookup_page == LookupPage::Rank {
+                            self.ui_stock_lookup(ui);
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .id_salt("lookup_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    self.ui_stock_lookup(ui);
+                                });
+                        }
+                    });
                     return;
                 }
                 egui::ScrollArea::vertical()
