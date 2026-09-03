@@ -10,6 +10,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 pub struct Field {
     pub label: String,
     pub value: String,
+    /// 可全市场排序时填目录 id；日期/长文等不可比的为空。
+    pub sort_id: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +123,15 @@ fn kv(rows: &mut Vec<Field>, label: &str, value: String) {
     rows.push(Field {
         label: label.into(),
         value,
+        sort_id: None,
+    });
+}
+
+fn kvs(rows: &mut Vec<Field>, label: &str, value: String, sort_id: &'static str) {
+    rows.push(Field {
+        label: label.into(),
+        value,
+        sort_id: Some(sort_id),
     });
 }
 
@@ -204,10 +215,10 @@ pub fn lookup_stock(db_path: &str, raw_code: &str) -> Result<StockSnapshot, Stri
             kv(&mut rows, "抓取日", r[10].clone());
             kv(&mut rows, "状态", r[11].clone());
             kv(&mut rows, "综合评级", r[3].clone());
-            kv(&mut rows, "技术", r[4].clone());
-            kv(&mut rows, "资金", r[5].clone());
-            kv(&mut rows, "市场", r[6].clone());
-            kv(&mut rows, "财务", r[7].clone());
+            kvs(&mut rows, "技术", r[4].clone(), "scores.technology");
+            kvs(&mut rows, "资金", r[5].clone(), "scores.capital");
+            kvs(&mut rows, "市场", r[6].clone(), "scores.market");
+            kvs(&mut rows, "财务", r[7].clone(), "scores.finance");
             kv(&mut rows, "是否次新", r[8].clone());
             sections.push(Section {
                 title: "百度财经 · 综合评分".into(),
@@ -251,8 +262,27 @@ pub fn lookup_stock(db_path: &str, raw_code: &str) -> Result<StockSnapshot, Stri
                 other => other,
             };
             let mut rows = Vec::new();
-            kv(&mut rows, "支撑位", r[1].clone());
-            kv(&mut rows, "阻力位", r[2].clone());
+            let sid = if cyc == "short" { "short" } else { "long" };
+            kvs(
+                &mut rows,
+                "支撑位",
+                r[1].clone(),
+                if sid == "short" {
+                    "sr.short.support_level"
+                } else {
+                    "sr.long.support_level"
+                },
+            );
+            kvs(
+                &mut rows,
+                "阻力位",
+                r[2].clone(),
+                if sid == "short" {
+                    "sr.short.resistance_level"
+                } else {
+                    "sr.long.resistance_level"
+                },
+            );
             kv(&mut rows, "智能评级", r[4].clone());
             kv(&mut rows, "评级等级", r[5].clone());
             kv(&mut rows, "评级状态", r[6].clone());
@@ -280,15 +310,15 @@ pub fn lookup_stock(db_path: &str, raw_code: &str) -> Result<StockSnapshot, Stri
         ) {
             found = true;
             let mut rows = Vec::new();
-            kv(&mut rows, "超大单净额", r[0].clone());
-            kv(&mut rows, "大单净额", r[1].clone());
-            kv(&mut rows, "中单净额", r[2].clone());
-            kv(&mut rows, "小单净额", r[3].clone());
-            kv(&mut rows, "主力净流入", r[4].clone());
-            kv(&mut rows, "超大占比", r[5].clone());
-            kv(&mut rows, "大单占比", r[6].clone());
-            kv(&mut rows, "中单占比", r[7].clone());
-            kv(&mut rows, "小单占比", r[8].clone());
+            kvs(&mut rows, "超大单净额", r[0].clone(), "fund_flow.super_net");
+            kvs(&mut rows, "大单净额", r[1].clone(), "fund_flow.large_net");
+            kvs(&mut rows, "中单净额", r[2].clone(), "fund_flow.medium_net");
+            kvs(&mut rows, "小单净额", r[3].clone(), "fund_flow.little_net");
+            kvs(&mut rows, "主力净流入", r[4].clone(), "fund_flow.main_net");
+            kvs(&mut rows, "超大占比", r[5].clone(), "fund_flow.super_rate");
+            kvs(&mut rows, "大单占比", r[6].clone(), "fund_flow.large_rate");
+            kvs(&mut rows, "中单占比", r[7].clone(), "fund_flow.medium_rate");
+            kvs(&mut rows, "小单占比", r[8].clone(), "fund_flow.little_rate");
             kv(&mut rows, "批次日", r[9].clone());
             kv(&mut rows, "分析日", r[10].clone());
             sections.push(Section {
@@ -309,14 +339,14 @@ pub fn lookup_stock(db_path: &str, raw_code: &str) -> Result<StockSnapshot, Stri
         ) {
             found = true;
             let mut rows = Vec::new();
-            kv(&mut rows, "看涨", r[0].clone());
-            kv(&mut rows, "看跌", r[1].clone());
-            kv(&mut rows, "总票数", r[2].clone());
-            kv(&mut rows, "看涨率", r[3].clone());
-            kv(&mut rows, "看跌率", r[4].clone());
-            kv(&mut rows, "本周看涨", r[5].clone());
-            kv(&mut rows, "本周看跌", r[6].clone());
-            kv(&mut rows, "本周看涨率", r[7].clone());
+            kvs(&mut rows, "看涨", r[0].clone(), "vote.vote_up");
+            kvs(&mut rows, "看跌", r[1].clone(), "vote.vote_down");
+            kvs(&mut rows, "总票数", r[2].clone(), "vote.total_num");
+            kvs(&mut rows, "看涨率", r[3].clone(), "vote.vote_up_rate");
+            kvs(&mut rows, "看跌率", r[4].clone(), "vote.vote_down_rate");
+            kvs(&mut rows, "本周看涨", r[5].clone(), "vote.week_up");
+            kvs(&mut rows, "本周看跌", r[6].clone(), "vote.week_down");
+            kvs(&mut rows, "本周看涨率", r[7].clone(), "vote.week_rate");
             kv(&mut rows, "批次日", r[8].clone());
             kv(&mut rows, "分析日", r[9].clone());
             sections.push(Section {
@@ -344,23 +374,33 @@ pub fn lookup_stock(db_path: &str, raw_code: &str) -> Result<StockSnapshot, Stri
             let mut rows = Vec::new();
             kv(&mut rows, "数据日", r[1].clone());
             kv(&mut rows, "抓取日", r[18].clone());
-            kv(&mut rows, "综合得分", r[2].clone());
-            kv(&mut rows, "全市场排名", r[3].clone());
-            kv(&mut rows, "排名变动", r[4].clone());
-            kv(&mut rows, "关注指数", r[5].clone());
-            kv(&mut rows, "机构参与度", r[6].clone());
+            kvs(&mut rows, "综合得分", r[2].clone(), "em_comment.emc_total_score");
+            kvs(&mut rows, "全市场排名", r[3].clone(), "em_comment.emc_rank");
+            kvs(&mut rows, "排名变动", r[4].clone(), "em_comment.emc_rank_up");
+            kvs(&mut rows, "关注指数", r[5].clone(), "em_comment.emc_focus");
+            kvs(&mut rows, "机构参与度", r[6].clone(), "em_comment.emc_org_participate");
             kv(&mut rows, "控盘程度", ctrl_degree(&r[6]));
-            kv(&mut rows, "机构参与比例", r[7].clone());
-            kv(&mut rows, "主力成本(实时)", r[8].clone());
-            kv(&mut rows, "主力成本(20日)", r[9].clone());
-            kv(&mut rows, "主力成本(60日)", r[10].clone());
-            kv(&mut rows, "主力净流入", r[11].clone());
-            kv(&mut rows, "超大单流入", r[12].clone());
-            kv(&mut rows, "超大单流出", r[13].clone());
-            kv(&mut rows, "大单流入", r[14].clone());
-            kv(&mut rows, "大单流出", r[15].clone());
-            kv(&mut rows, "买入超大单占比", r[16].clone());
-            kv(&mut rows, "买入大单占比", r[17].clone());
+            kvs(&mut rows, "机构参与比例", r[7].clone(), "em_comment.emc_ratio");
+            kvs(&mut rows, "主力成本(实时)", r[8].clone(), "em_comment.emc_prime_cost");
+            kvs(&mut rows, "主力成本(20日)", r[9].clone(), "em_comment.emc_prime_cost_20d");
+            kvs(&mut rows, "主力成本(60日)", r[10].clone(), "em_comment.emc_prime_cost_60d");
+            kvs(&mut rows, "主力净流入", r[11].clone(), "em_comment.emc_prime_inflow");
+            kvs(&mut rows, "超大单流入", r[12].clone(), "em_comment.emc_superdeal_in");
+            kvs(&mut rows, "超大单流出", r[13].clone(), "em_comment.emc_superdeal_out");
+            kvs(&mut rows, "大单流入", r[14].clone(), "em_comment.emc_bigdeal_in");
+            kvs(&mut rows, "大单流出", r[15].clone(), "em_comment.emc_bigdeal_out");
+            kvs(
+                &mut rows,
+                "买入超大单占比",
+                r[16].clone(),
+                "em_comment.emc_buy_superdeal_ratio",
+            );
+            kvs(
+                &mut rows,
+                "买入大单占比",
+                r[17].clone(),
+                "em_comment.emc_buy_bigdeal_ratio",
+            );
             sections.push(Section {
                 title: "东方财富 · 千股千评".into(),
                 wide: false,
@@ -385,15 +425,15 @@ pub fn lookup_stock(db_path: &str, raw_code: &str) -> Result<StockSnapshot, Stri
             let mut rows = Vec::new();
             kv(&mut rows, "数据日", r[1].clone());
             kv(&mut rows, "抓取日", r[12].clone());
-            kv(&mut rows, "PE(TTM)", r[2].clone());
-            kv(&mut rows, "PE(LAR)", r[3].clone());
-            kv(&mut rows, "PB(MRQ)", r[4].clone());
-            kv(&mut rows, "PCF_OCF(LAR)", r[5].clone());
-            kv(&mut rows, "PCF_OCF(TTM)", r[6].clone());
-            kv(&mut rows, "PS(TTM)", r[7].clone());
-            kv(&mut rows, "PEG", r[8].clone());
-            kv(&mut rows, "总市值", r[9].clone());
-            kv(&mut rows, "流通市值", r[10].clone());
+            kvs(&mut rows, "PE(TTM)", r[2].clone(), "em_valuation.emv_pe_ttm");
+            kvs(&mut rows, "PE(LAR)", r[3].clone(), "em_valuation.emv_pe_lar");
+            kvs(&mut rows, "PB(MRQ)", r[4].clone(), "em_valuation.emv_pb_mrq");
+            kvs(&mut rows, "PCF_OCF(LAR)", r[5].clone(), "em_valuation.emv_pcf_ocf_lar");
+            kvs(&mut rows, "PCF_OCF(TTM)", r[6].clone(), "em_valuation.emv_pcf_ocf_ttm");
+            kvs(&mut rows, "PS(TTM)", r[7].clone(), "em_valuation.emv_ps_ttm");
+            kvs(&mut rows, "PEG", r[8].clone(), "em_valuation.emv_peg");
+            kvs(&mut rows, "总市值", r[9].clone(), "em_valuation.emv_total_market_cap");
+            kvs(&mut rows, "流通市值", r[10].clone(), "em_valuation.emv_float_market_cap");
             kv(&mut rows, "板块", r[11].clone());
             sections.push(Section {
                 title: "东方财富 · 基本面估值".into(),
@@ -414,13 +454,13 @@ pub fn lookup_stock(db_path: &str, raw_code: &str) -> Result<StockSnapshot, Stri
             found = true;
             let mut rows = Vec::new();
             kv(&mut rows, "数据日", r[0].clone());
-            kv(&mut rows, "次日上涨概率", with_pct(&r[1]));
-            kv(&mut rows, "5日上涨概率", with_pct(&r[2]));
-            kv(&mut rows, "次日平均涨跌", r[3].clone());
-            kv(&mut rows, "5日平均涨跌", r[4].clone());
-            kv(&mut rows, "打败比例", with_pct(&r[7]));
-            kv(&mut rows, "样本数(次日)", r[5].clone());
-            kv(&mut rows, "样本数(5日)", r[6].clone());
+            kvs(&mut rows, "次日上涨概率", with_pct(&r[1]), "em_diag_prob.emt_rise_1_prob");
+            kvs(&mut rows, "5日上涨概率", with_pct(&r[2]), "em_diag_prob.emt_rise_5_prob");
+            kvs(&mut rows, "次日平均涨跌", r[3].clone(), "em_diag_prob.emt_avg_1_inc");
+            kvs(&mut rows, "5日平均涨跌", r[4].clone(), "em_diag_prob.emt_avg_5_inc");
+            kvs(&mut rows, "打败比例", with_pct(&r[7]), "em_diag_prob.emt_rank_ratio");
+            kvs(&mut rows, "样本数(次日)", r[5].clone(), "em_diag_prob.emt_all_count_1");
+            kvs(&mut rows, "样本数(5日)", r[6].clone(), "em_diag_prob.emt_all_count_5");
             kv(&mut rows, "抓取日", r[8].clone());
             sections.push(Section {
                 title: "东方财富 · 诊断概率".into(),
@@ -440,10 +480,10 @@ pub fn lookup_stock(db_path: &str, raw_code: &str) -> Result<StockSnapshot, Stri
             found = true;
             let mut rows = Vec::new();
             kv(&mut rows, "数据日", r[0].clone());
-            kv(&mut rows, "当日参与意愿值", r[1].clone());
-            kv(&mut rows, "五日平均参与意愿值", r[2].clone());
-            kv(&mut rows, "当日参与意愿变化%", r[3].clone());
-            kv(&mut rows, "五日参与意愿变化%", r[4].clone());
+            kvs(&mut rows, "当日参与意愿值", r[1].clone(), "em_participation.emp_wish");
+            kvs(&mut rows, "五日平均参与意愿值", r[2].clone(), "em_participation.emp_wish_5d");
+            kvs(&mut rows, "当日参与意愿变化%", r[3].clone(), "em_participation.emp_wish_change");
+            kvs(&mut rows, "五日参与意愿变化%", r[4].clone(), "em_participation.emp_wish_5d_change");
             kv(&mut rows, "抓取日", r[5].clone());
             sections.push(Section {
                 title: "东方财富 · 参与意愿".into(),
@@ -464,20 +504,22 @@ pub fn lookup_stock(db_path: &str, raw_code: &str) -> Result<StockSnapshot, Stri
             found = true;
             let mut rows = Vec::new();
             kv(&mut rows, "数据日", r[0].clone());
-            kv(
+            kvs(
                 &mut rows,
                 "综合市场排名",
                 format!("{} / {}", r[1], r[2]),
+                "em_popularity.emp_market_rank",
             );
-            kv(&mut rows, "行业排名", r[3].clone());
-            kv(&mut rows, "综合得分变化率%", r[4].clone());
-            kv(&mut rows, "全市场股票数", r[5].clone());
-            kv(
+            kvs(&mut rows, "行业排名", r[3].clone(), "em_popularity.emp_industry_rank");
+            kvs(&mut rows, "综合得分变化率%", r[4].clone(), "em_popularity.emp_change_rate");
+            kvs(&mut rows, "全市场股票数", r[5].clone(), "em_popularity.emp_market_stock_num");
+            kvs(
                 &mut rows,
                 "关注排名",
                 format!("{} / {}", r[6], r[7]),
+                "em_popularity.emp_focus_rank",
             );
-            kv(&mut rows, "关注指数", r[8].clone());
+            kvs(&mut rows, "关注指数", r[8].clone(), "em_popularity.emp_focus_index");
             kv(&mut rows, "抓取日", r[9].clone());
             sections.push(Section {
                 title: "东方财富 · 市场排名".into(),
@@ -537,11 +579,19 @@ pub fn lookup_stock(db_path: &str, raw_code: &str) -> Result<StockSnapshot, Stri
                     other => other,
                 };
                 let ok = if r[2] == "1" { "成功" } else { "未成功" };
-                kv(&mut rows, &format!("{src} 次数"), r[1].clone());
+                let count_id = match r[0].as_str() {
+                    "em" => "crawl_stats.em.crawl_count",
+                    _ => "crawl_stats.baidu.crawl_count",
+                };
+                let streak_id = match r[0].as_str() {
+                    "em" => "crawl_stats.em.empty_streak",
+                    _ => "crawl_stats.baidu.empty_streak",
+                };
+                kvs(&mut rows, &format!("{src} 次数"), r[1].clone(), count_id);
                 kv(&mut rows, &format!("{src} 最近"), format!("{} / {}", ok, r[3]));
                 kv(&mut rows, &format!("{src} 尝试日"), r[4].clone());
                 kv(&mut rows, &format!("{src} 更新"), r[5].clone());
-                kv(&mut rows, &format!("{src} 空壳连击"), r[6].clone());
+                kvs(&mut rows, &format!("{src} 空壳连击"), r[6].clone(), streak_id);
             }
             sections.push(Section {
                 title: "抓取统计".into(),
@@ -576,6 +626,250 @@ fn with_pct(s: &str) -> String {
     } else {
         format!("{s} %")
     }
+}
+
+/// 全市场排名一行。
+#[derive(Debug, Clone)]
+pub struct RankRow {
+    pub rank: usize,
+    pub code: String,
+    pub name: String,
+    #[allow(dead_code)]
+    pub value: f64,
+    pub value_text: String,
+}
+
+/// 某个字段对已抓取全市场的排序结果。
+#[derive(Debug, Clone)]
+pub struct RankBoard {
+    pub spec_id: String,
+    pub label: String,
+    pub ascending: bool,
+    pub rows: Vec<RankRow>,
+}
+
+impl RankBoard {
+    pub fn origin_rank(&self, code: &str) -> Option<usize> {
+        self.rows.iter().find(|r| r.code == code).map(|r| r.rank)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LatestBy {
+    /// 百度表：真实分析日优先。
+    Ut,
+    /// 东财表：按数据日。
+    Td,
+    /// crawl_stats：每股一行。
+    None,
+}
+
+struct RankSpec {
+    id: &'static str,
+    label: &'static str,
+    table: &'static str,
+    value_expr: &'static str,
+    extra_sql: &'static str,
+    latest: LatestBy,
+    has_name: bool,
+    pct: bool,
+}
+
+fn rank_specs() -> &'static [RankSpec] {
+    &[
+        RankSpec { id: "scores.technology", label: "技术", table: "scores", value_expr: "CAST(s.technology AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: true, pct: false },
+        RankSpec { id: "scores.capital", label: "资金", table: "scores", value_expr: "CAST(s.capital AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: true, pct: false },
+        RankSpec { id: "scores.market", label: "市场", table: "scores", value_expr: "CAST(s.market AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: true, pct: false },
+        RankSpec { id: "scores.finance", label: "财务", table: "scores", value_expr: "CAST(s.finance AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: true, pct: false },
+        RankSpec { id: "sr.long.support_level", label: "支撑位（长期）", table: "support_resistance", value_expr: "CAST(s.support_level AS REAL)", extra_sql: "AND s.cycle='long'", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "sr.long.resistance_level", label: "阻力位（长期）", table: "support_resistance", value_expr: "CAST(s.resistance_level AS REAL)", extra_sql: "AND s.cycle='long'", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "sr.short.support_level", label: "支撑位（短期）", table: "support_resistance", value_expr: "CAST(s.support_level AS REAL)", extra_sql: "AND s.cycle='short'", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "sr.short.resistance_level", label: "阻力位（短期）", table: "support_resistance", value_expr: "CAST(s.resistance_level AS REAL)", extra_sql: "AND s.cycle='short'", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "fund_flow.super_net", label: "超大单净额", table: "fund_flow", value_expr: "s.super_net", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "fund_flow.large_net", label: "大单净额", table: "fund_flow", value_expr: "s.large_net", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "fund_flow.medium_net", label: "中单净额", table: "fund_flow", value_expr: "s.medium_net", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "fund_flow.little_net", label: "小单净额", table: "fund_flow", value_expr: "s.little_net", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "fund_flow.main_net", label: "主力净流入", table: "fund_flow", value_expr: "s.main_net", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "fund_flow.super_rate", label: "超大占比", table: "fund_flow", value_expr: "CAST(REPLACE(REPLACE(s.super_rate,'%',''),',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: true },
+        RankSpec { id: "fund_flow.large_rate", label: "大单占比", table: "fund_flow", value_expr: "CAST(REPLACE(REPLACE(s.large_rate,'%',''),',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: true },
+        RankSpec { id: "fund_flow.medium_rate", label: "中单占比", table: "fund_flow", value_expr: "CAST(REPLACE(REPLACE(s.medium_rate,'%',''),',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: true },
+        RankSpec { id: "fund_flow.little_rate", label: "小单占比", table: "fund_flow", value_expr: "CAST(REPLACE(REPLACE(s.little_rate,'%',''),',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: true },
+        RankSpec { id: "vote.vote_up", label: "看涨", table: "vote", value_expr: "CAST(REPLACE(s.vote_up,',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "vote.vote_down", label: "看跌", table: "vote", value_expr: "CAST(REPLACE(s.vote_down,',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "vote.total_num", label: "总票数", table: "vote", value_expr: "CAST(REPLACE(s.total_num,',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "vote.vote_up_rate", label: "看涨率", table: "vote", value_expr: "CAST(REPLACE(REPLACE(s.vote_up_rate,'%',''),',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: true },
+        RankSpec { id: "vote.vote_down_rate", label: "看跌率", table: "vote", value_expr: "CAST(REPLACE(REPLACE(s.vote_down_rate,'%',''),',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: true },
+        RankSpec { id: "vote.week_up", label: "本周看涨", table: "vote", value_expr: "CAST(REPLACE(s.week_up,',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "vote.week_down", label: "本周看跌", table: "vote", value_expr: "CAST(REPLACE(s.week_down,',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: false },
+        RankSpec { id: "vote.week_rate", label: "本周看涨率", table: "vote", value_expr: "CAST(REPLACE(REPLACE(s.week_rate,'%',''),',','') AS REAL)", extra_sql: "", latest: LatestBy::Ut, has_name: false, pct: true },
+        RankSpec { id: "em_comment.emc_total_score", label: "综合得分", table: "em_comment", value_expr: "s.emc_total_score", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_rank", label: "全市场排名", table: "em_comment", value_expr: "s.emc_rank", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_rank_up", label: "排名变动", table: "em_comment", value_expr: "s.emc_rank_up", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_focus", label: "关注指数", table: "em_comment", value_expr: "s.emc_focus", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_org_participate", label: "机构参与度", table: "em_comment", value_expr: "s.emc_org_participate", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_ratio", label: "机构参与比例", table: "em_comment", value_expr: "s.emc_ratio", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_prime_cost", label: "主力成本(实时)", table: "em_comment", value_expr: "s.emc_prime_cost", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_prime_cost_20d", label: "主力成本(20日)", table: "em_comment", value_expr: "s.emc_prime_cost_20d", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_prime_cost_60d", label: "主力成本(60日)", table: "em_comment", value_expr: "s.emc_prime_cost_60d", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_prime_inflow", label: "主力净流入", table: "em_comment", value_expr: "s.emc_prime_inflow", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_superdeal_in", label: "超大单流入", table: "em_comment", value_expr: "s.emc_superdeal_in", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_superdeal_out", label: "超大单流出", table: "em_comment", value_expr: "s.emc_superdeal_out", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_bigdeal_in", label: "大单流入", table: "em_comment", value_expr: "s.emc_bigdeal_in", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_bigdeal_out", label: "大单流出", table: "em_comment", value_expr: "s.emc_bigdeal_out", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_buy_superdeal_ratio", label: "买入超大单占比", table: "em_comment", value_expr: "s.emc_buy_superdeal_ratio", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_comment.emc_buy_bigdeal_ratio", label: "买入大单占比", table: "em_comment", value_expr: "s.emc_buy_bigdeal_ratio", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_valuation.emv_pe_ttm", label: "PE(TTM)", table: "em_valuation", value_expr: "s.emv_pe_ttm", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_valuation.emv_pe_lar", label: "PE(LAR)", table: "em_valuation", value_expr: "s.emv_pe_lar", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_valuation.emv_pb_mrq", label: "PB(MRQ)", table: "em_valuation", value_expr: "s.emv_pb_mrq", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_valuation.emv_pcf_ocf_lar", label: "PCF_OCF(LAR)", table: "em_valuation", value_expr: "s.emv_pcf_ocf_lar", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_valuation.emv_pcf_ocf_ttm", label: "PCF_OCF(TTM)", table: "em_valuation", value_expr: "s.emv_pcf_ocf_ttm", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_valuation.emv_ps_ttm", label: "PS(TTM)", table: "em_valuation", value_expr: "s.emv_ps_ttm", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_valuation.emv_peg", label: "PEG", table: "em_valuation", value_expr: "s.emv_peg", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_valuation.emv_total_market_cap", label: "总市值", table: "em_valuation", value_expr: "s.emv_total_market_cap", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_valuation.emv_float_market_cap", label: "流通市值", table: "em_valuation", value_expr: "s.emv_float_market_cap", extra_sql: "", latest: LatestBy::Td, has_name: true, pct: false },
+        RankSpec { id: "em_diag_prob.emt_rise_1_prob", label: "次日上涨概率", table: "em_diag_prob", value_expr: "s.emt_rise_1_prob", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: true },
+        RankSpec { id: "em_diag_prob.emt_rise_5_prob", label: "5日上涨概率", table: "em_diag_prob", value_expr: "s.emt_rise_5_prob", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: true },
+        RankSpec { id: "em_diag_prob.emt_avg_1_inc", label: "次日平均涨跌", table: "em_diag_prob", value_expr: "s.emt_avg_1_inc", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_diag_prob.emt_avg_5_inc", label: "5日平均涨跌", table: "em_diag_prob", value_expr: "s.emt_avg_5_inc", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_diag_prob.emt_rank_ratio", label: "打败比例", table: "em_diag_prob", value_expr: "s.emt_rank_ratio", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: true },
+        RankSpec { id: "em_diag_prob.emt_all_count_1", label: "样本数(次日)", table: "em_diag_prob", value_expr: "s.emt_all_count_1", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_diag_prob.emt_all_count_5", label: "样本数(5日)", table: "em_diag_prob", value_expr: "s.emt_all_count_5", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_participation.emp_wish", label: "当日参与意愿值", table: "em_participation", value_expr: "s.emp_wish", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_participation.emp_wish_5d", label: "五日平均参与意愿值", table: "em_participation", value_expr: "s.emp_wish_5d", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_participation.emp_wish_change", label: "当日参与意愿变化%", table: "em_participation", value_expr: "s.emp_wish_change", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_participation.emp_wish_5d_change", label: "五日参与意愿变化%", table: "em_participation", value_expr: "s.emp_wish_5d_change", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_popularity.emp_market_rank", label: "综合市场排名", table: "em_popularity", value_expr: "s.emp_market_rank", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_popularity.emp_industry_rank", label: "行业排名", table: "em_popularity", value_expr: "s.emp_industry_rank", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_popularity.emp_change_rate", label: "综合得分变化率%", table: "em_popularity", value_expr: "s.emp_change_rate", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_popularity.emp_market_stock_num", label: "全市场股票数", table: "em_popularity", value_expr: "s.emp_market_stock_num", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_popularity.emp_focus_rank", label: "关注排名", table: "em_popularity", value_expr: "s.emp_focus_rank", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "em_popularity.emp_focus_index", label: "关注指数", table: "em_popularity", value_expr: "s.emp_focus_index", extra_sql: "", latest: LatestBy::Td, has_name: false, pct: false },
+        RankSpec { id: "crawl_stats.baidu.crawl_count", label: "百度 次数", table: "crawl_stats", value_expr: "s.crawl_count", extra_sql: "AND s.source='baidu'", latest: LatestBy::None, has_name: false, pct: false },
+        RankSpec { id: "crawl_stats.em.crawl_count", label: "东财 次数", table: "crawl_stats", value_expr: "s.crawl_count", extra_sql: "AND s.source='em'", latest: LatestBy::None, has_name: false, pct: false },
+        RankSpec { id: "crawl_stats.baidu.empty_streak", label: "百度 空壳连击", table: "crawl_stats", value_expr: "s.empty_streak", extra_sql: "AND s.source='baidu'", latest: LatestBy::None, has_name: false, pct: false },
+        RankSpec { id: "crawl_stats.em.empty_streak", label: "东财 空壳连击", table: "crawl_stats", value_expr: "s.empty_streak", extra_sql: "AND s.source='em'", latest: LatestBy::None, has_name: false, pct: false },
+    ]
+}
+
+fn spec_by_id(id: &str) -> Option<&'static RankSpec> {
+    rank_specs().iter().find(|s| s.id == id)
+}
+
+/// 当前详情里第一个能排的字段；优先综合得分 / 技术。
+pub fn default_rank_id(snap: &StockSnapshot) -> Option<&'static str> {
+    const PREFER: &[&str] = &[
+        "em_comment.emc_total_score",
+        "scores.technology",
+        "em_diag_prob.emt_rise_1_prob",
+        "fund_flow.main_net",
+        "vote.vote_up_rate",
+    ];
+    let have: Vec<&str> = snap
+        .sections
+        .iter()
+        .flat_map(|s| s.rows.iter())
+        .filter_map(|f| f.sort_id)
+        .collect();
+    PREFER
+        .iter()
+        .copied()
+        .find(|id| have.contains(id))
+        .or_else(|| have.first().copied())
+}
+
+fn open_ro(db_path: &str) -> Result<Connection, String> {
+    if !std::path::Path::new(db_path).exists() {
+        return Err(format!("找不到数据库文件：{db_path}"));
+    }
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("打开数据库失败: {e}"))?;
+    conn.busy_timeout(Duration::from_millis(8000))
+        .map_err(|e| format!("设置等待锁超时失败: {e}"))?;
+    Ok(conn)
+}
+
+fn rank_sql(spec: &RankSpec, ascending: bool) -> String {
+    let dir = if ascending { "ASC" } else { "DESC" };
+    let name_fb = if spec.has_name { "s.name" } else { "NULL" };
+    let extra = spec.extra_sql;
+    let ve = spec.value_expr;
+    let table = spec.table;
+    match table {
+        "scores" | "support_resistance" | "fund_flow" | "vote" | "em_comment"
+        | "em_valuation" | "em_diag_prob" | "em_participation" | "em_popularity"
+        | "crawl_stats" => {}
+        _ => unreachable!("ranking table whitelist"),
+    }
+    let filter = format!("({ve}) IS NOT NULL AND CAST(({ve}) AS TEXT) GLOB '*[0-9]*'");
+    match spec.latest {
+        LatestBy::None => format!(
+            "SELECT s.code AS code, COALESCE(st.name, {name_fb}, '') AS name, ({ve}) AS v \
+             FROM {table} s LEFT JOIN stocks st ON st.code = s.code \
+             WHERE {filter} {extra} ORDER BY v {dir}, s.code ASC"
+        ),
+        LatestBy::Ut => format!(
+            "SELECT code, name, v FROM ( \
+                SELECT s.code AS code, COALESCE(st.name, {name_fb}, '') AS name, ({ve}) AS v, \
+                       ROW_NUMBER() OVER (PARTITION BY s.code ORDER BY COALESCE(s.update_time, s.trade_date) DESC) AS rn \
+                FROM {table} s LEFT JOIN stocks st ON st.code = s.code \
+                WHERE 1=1 {extra} \
+             ) WHERE rn = 1 AND v IS NOT NULL AND CAST(v AS TEXT) GLOB '*[0-9]*' \
+             ORDER BY v {dir}, code ASC"
+        ),
+        LatestBy::Td => format!(
+            "SELECT code, name, v FROM ( \
+                SELECT s.code AS code, COALESCE(st.name, {name_fb}, '') AS name, ({ve}) AS v, \
+                       ROW_NUMBER() OVER (PARTITION BY s.code ORDER BY s.trade_date DESC) AS rn \
+                FROM {table} s LEFT JOIN stocks st ON st.code = s.code \
+                WHERE 1=1 {extra} \
+             ) WHERE rn = 1 AND v IS NOT NULL AND CAST(v AS TEXT) GLOB '*[0-9]*' \
+             ORDER BY v {dir}, code ASC"
+        ),
+    }
+}
+
+/// 对已抓取全市场按某一字段正序/倒序排名（各表取该股最新一行）。
+pub fn rank_market(db_path: &str, spec_id: &str, ascending: bool) -> Result<RankBoard, String> {
+    let spec = spec_by_id(spec_id).ok_or_else(|| format!("该字段不支持排序：{spec_id}"))?;
+    let conn = open_ro(db_path)?;
+    if !table_ok(&conn, spec.table) {
+        return Err(format!("库里还没有「{}」这张表", spec.label));
+    }
+    let sql = rank_sql(spec, ascending);
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("排名查询失败: {e}"))?;
+    let mapped = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, f64>(2)?,
+            ))
+        })
+        .map_err(|e| format!("排名读取失败: {e}"))?;
+    let mut rows = Vec::new();
+    for (i, item) in mapped.enumerate() {
+        let (code, name, value) = item.map_err(|e| format!("排名行失败: {e}"))?;
+        let mut value_text = fmt_num(value);
+        if spec.pct && value_text != "—" {
+            value_text = format!("{value_text} %");
+        }
+        rows.push(RankRow {
+            rank: i + 1,
+            code,
+            name,
+            value,
+            value_text,
+        });
+    }
+    if rows.is_empty() {
+        return Err(format!("「{}」在已抓取数据里没有可比较的数值", spec.label));
+    }
+    Ok(RankBoard {
+        spec_id: spec.id.to_string(),
+        label: spec.label.to_string(),
+        ascending,
+        rows,
+    })
 }
 
 #[cfg(test)]
@@ -623,6 +917,60 @@ mod tests {
         let text = snap.as_text();
         assert!(text.contains("综合评级"));
         assert!(text.contains("8.1"));
+        assert!(snap.sections.iter().any(|s| {
+            s.rows.iter().any(|f| f.sort_id == Some("scores.technology"))
+        }));
+    }
+
+    #[test]
+    fn rank_market_asc_then_desc() {
+        let path = std::env::temp_dir().join("mp_rank_v110.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(crate::db::SCHEMA).unwrap();
+            conn.execute_batch(crate::db::EM_SCHEMA).unwrap();
+            for (code, name, tech) in [
+                ("000001", "平安银行", "3"),
+                ("000002", "万科A", "1"),
+                ("000003", "PT金田A", "2"),
+            ] {
+                conn.execute(
+                    "INSERT INTO stocks(code,name,market) VALUES(?1,?2,'SZ')",
+                    rusqlite::params![code, name],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO scores(trade_date,code,name,synthesis,technology,capital,market,finance,\
+                     is_new,update_time,crawl_date,status) \
+                     VALUES('2026-09-01',?1,?2,'买',?3,'0','0','0','0','2026-09-01','2026-09-01','ok')",
+                    rusqlite::params![code, name, tech],
+                )
+                .unwrap();
+            }
+            // 旧日期不应参与排名
+            conn.execute(
+                "INSERT INTO scores(trade_date,code,name,synthesis,technology,capital,market,finance,\
+                 is_new,update_time,crawl_date,status) \
+                 VALUES('2026-08-01','000002','万科A','买','99','0','0','0','0','2026-08-01','2026-08-01','ok')",
+                [],
+            )
+            .unwrap();
+        }
+        let p = path.to_str().unwrap();
+        let asc = rank_market(p, "scores.technology", true).unwrap();
+        let desc = rank_market(p, "scores.technology", false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            asc.rows.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            vec!["000002", "000003", "000001"]
+        );
+        assert_eq!(
+            desc.rows.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            vec!["000001", "000003", "000002"]
+        );
+        assert_eq!(asc.origin_rank("000001"), Some(3));
+        assert_eq!(desc.origin_rank("000001"), Some(1));
     }
 }
 
