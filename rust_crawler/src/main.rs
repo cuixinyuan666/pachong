@@ -793,54 +793,84 @@ impl CrawlerApp {
         }
     }
 
-    /// 主区个股查询：分组卡片 + 两列标签/值，长文整行折行。
-    fn ui_stock_lookup(&mut self, ui: &mut egui::Ui) {
+    /// 查询栏：compact=true 时单行工具条，给排名列表留足高度。
+    fn ui_lookup_toolbar(&mut self, ui: &mut egui::Ui, compact: bool) -> (bool, bool, bool, bool, bool) {
         let mut do_query = false;
         let mut do_copy = false;
         let mut do_rank = false;
         let mut do_back = false;
-        panel(ui, "按代码查询", |ui| {
-            ui.colored_label(DIM, "查的是本地库里该股各表最新一行，不是实时行情。代码可写 1、000001、000001.SZ。");
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.lookup_code)
-                        .desired_width(140.0)
-                        .hint_text("如 000001")
-                        .font(egui::TextStyle::Monospace),
-                );
-                if ui.button("查询").clicked()
-                    || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                {
-                    do_query = true;
-                }
-                if ui
-                    .add_enabled(self.lookup.is_some() || self.origin_snap.is_some(), egui::Button::new("排名"))
-                    .clicked()
-                {
-                    do_rank = true;
-                }
-                if ui.button("说明").clicked() {
-                    self.show_rank_help = true;
-                }
+        let mut do_help = false;
+        let draw = |ui: &mut egui::Ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.lookup_code)
+                    .desired_width(if compact { 100.0 } else { 140.0 })
+                    .hint_text("如 000001")
+                    .font(egui::TextStyle::Monospace),
+            );
+            if ui.button("查询").clicked()
+                || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+            {
+                do_query = true;
+            }
+            if ui
+                .add_enabled(
+                    self.lookup.is_some() || self.origin_snap.is_some(),
+                    egui::Button::new("排名"),
+                )
+                .clicked()
+            {
+                do_rank = true;
+            }
+            if ui.small_button(if compact { "?" } else { "说明" }).clicked() {
+                do_help = true;
+            }
+            if !compact {
                 if ui
                     .add_enabled(self.lookup.is_some(), egui::Button::new("复制全部"))
                     .clicked()
                 {
                     do_copy = true;
                 }
-                if self.needs_lookup_back() {
-                    let back = format!("返回 {}", self.origin_label());
-                    if ui.button(back).clicked() {
-                        do_back = true;
-                    }
+            }
+            if self.needs_lookup_back() {
+                let back = if compact {
+                    format!("← {}", self.origin_label())
+                } else {
+                    format!("返回 {}", self.origin_label())
+                };
+                if ui.button(back).clicked() {
+                    do_back = true;
                 }
+            }
+        };
+        if compact {
+            ui.horizontal(draw);
+        } else {
+            panel(ui, "按代码查询", |ui| {
+                ui.colored_label(
+                    DIM,
+                    "查的是本地库里该股各表最新一行，不是实时行情。代码可写 1、000001、000001.SZ。",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(draw);
+                ui.colored_label(
+                    DIM,
+                    "有「排」的字段可点：第一次正序、再点倒序，对全市场已抓取数据排名。",
+                );
             });
-            ui.colored_label(
-                DIM,
-                "有「排」的字段可点：第一次正序、再点倒序，对全市场已抓取数据排名。",
-            );
-        });
+        }
+        (do_query, do_rank, do_back, do_copy, do_help)
+    }
+
+    fn apply_lookup_toolbar(
+        &mut self,
+        ui: &egui::Ui,
+        do_query: bool,
+        do_rank: bool,
+        do_back: bool,
+        do_copy: bool,
+        do_help: bool,
+    ) {
         if do_query {
             self.run_stock_lookup();
         }
@@ -855,16 +885,43 @@ impl CrawlerApp {
                 ui.ctx().copy_text(s.as_text());
             }
         }
-        ui.add_space(10.0);
+        if do_help {
+            self.show_rank_help = true;
+        }
+    }
+
+    /// 排名页：紧凑顶栏 + 列表占满剩余主区。
+    fn ui_stock_lookup_rank(&mut self, ui: &mut egui::Ui) {
+        let (q, r, b, c, h) = self.ui_lookup_toolbar(ui, true);
+        self.apply_lookup_toolbar(ui, q, r, b, c, h);
         if !self.lookup_err.is_empty() {
             ui.colored_label(DANGER, &self.lookup_err);
         }
         if !self.rank_err.is_empty() {
             ui.colored_label(WARN, &self.rank_err);
         }
-        if self.lookup_page == LookupPage::Rank {
+        ui.add_space(4.0);
+        let area = ui.available_rect_before_wrap();
+        ui.allocate_ui(area.size(), |ui| {
+            ui.set_min_size(area.size());
             self.ui_rank_board(ui);
+        });
+    }
+
+    /// 主区个股查询：分组卡片 + 两列标签/值，长文整行折行。
+    fn ui_stock_lookup(&mut self, ui: &mut egui::Ui) {
+        if self.lookup_page == LookupPage::Rank {
+            self.ui_stock_lookup_rank(ui);
             return;
+        }
+        let (do_query, do_rank, do_back, do_copy, do_help) = self.ui_lookup_toolbar(ui, false);
+        self.apply_lookup_toolbar(ui, do_query, do_rank, do_back, do_copy, do_help);
+        ui.add_space(10.0);
+        if !self.lookup_err.is_empty() {
+            ui.colored_label(DANGER, &self.lookup_err);
+        }
+        if !self.rank_err.is_empty() {
+            ui.colored_label(WARN, &self.rank_err);
         }
         if !self.lookup_err.is_empty() && self.lookup.is_none() {
             return;
@@ -989,128 +1046,148 @@ impl CrawlerApp {
         let mut jump: Option<String> = None;
         let mut set_asc: Option<bool> = None;
 
-        panel(ui, &format!("全市场排名 · {}", board.label), |ui| {
-            ui.colored_label(
-                DIM,
-                format!(
-                    "{} · 已抓取 {} 支有此数值。点一行查看该股，返回回到 {}。",
-                    if board.ascending {
-                        "正序（从小到大）"
-                    } else {
-                        "倒序（从大到小）"
-                    },
-                    board.rows.len(),
-                    origin_label
-                ),
-            );
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.selectable_label(board.ascending, "正序").clicked() && !board.ascending {
-                    set_asc = Some(true);
-                }
-                if ui.selectable_label(!board.ascending, "倒序").clicked() && board.ascending {
-                    set_asc = Some(false);
-                }
-            });
-            if let Some(r) = my_rank {
-                ui.colored_label(
-                    ACCENT,
-                    egui::RichText::new(format!(
-                        "{} 当前第 {} / {}",
-                        origin_label,
-                        r,
-                        board.rows.len()
-                    ))
-                    .strong(),
-                );
-            } else if !origin_code.is_empty() {
-                ui.colored_label(DIM, format!("{} 这一项没有可比较数值，不在列表里", origin_label));
-            }
-        });
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [52.0, 18.0],
-                egui::Label::new(egui::RichText::new("#").size(12.0).color(DIM)),
-            );
-            ui.add_sized(
-                [76.0, 18.0],
-                egui::Label::new(egui::RichText::new("代码").size(12.0).color(DIM)),
-            );
-            ui.add_sized(
-                [120.0, 18.0],
-                egui::Label::new(egui::RichText::new("名称").size(12.0).color(DIM)),
-            );
-            ui.colored_label(DIM, egui::RichText::new(&board.label).size(12.0));
-        });
-        ui.separator();
-
-        let row_h = 28.0;
-        let n = board.rows.len();
-        // 用主区剩余固定高度，避免 max_height=∞ 时列表撑满全量行、滚轮无效。
-        let list_h = (ui.max_rect().bottom() - ui.cursor().top() - 6.0).max(160.0);
-        egui::ScrollArea::vertical()
-            .id_salt("rank_rows")
-            .auto_shrink([false, false])
-            .max_height(list_h)
-            .show_rows(ui, row_h, n, |ui, range| {
-                for i in range {
-                    let row = &board.rows[i];
-                    let is_origin = row.code == origin_code;
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width().max(320.0), row_h),
-                        egui::Sense::click(),
+        // 单行摘要，不包大 panel，把高度留给列表。
+        egui::Frame::none()
+            .fill(SURFACE)
+            .stroke(egui::Stroke::new(1.0, LINE))
+            .rounding(egui::Rounding::same(4.0))
+            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        INK,
+                        egui::RichText::new(format!("全市场排名 · {}", board.label))
+                            .size(14.0)
+                            .strong(),
                     );
-                    if is_origin {
-                        ui.painter().rect_filled(
-                            rect,
-                            2.0,
-                            egui::Color32::from_rgba_unmultiplied(13, 148, 136, 40),
+                    ui.add_space(8.0);
+                    if ui.selectable_label(board.ascending, "正序").clicked() && !board.ascending {
+                        set_asc = Some(true);
+                    }
+                    if ui.selectable_label(!board.ascending, "倒序").clicked() && board.ascending {
+                        set_asc = Some(false);
+                    }
+                    ui.colored_label(DIM, format!("共 {} 支", board.rows.len()));
+                    if let Some(r) = my_rank {
+                        ui.colored_label(
+                            ACCENT,
+                            egui::RichText::new(format!("{} 第 {}/{}", origin_label, r, board.rows.len()))
+                                .strong(),
                         );
-                    } else if resp.hovered() {
-                        ui.painter().rect_filled(rect, 2.0, SURFACE);
+                    } else if !origin_code.is_empty() {
+                        ui.colored_label(DIM, format!("{} 无此项数值", origin_label));
                     }
-                    let y = rect.center().y;
-                    let num_color = if is_origin { ACCENT } else { DIM };
-                    ui.painter().text(
-                        egui::pos2(rect.left() + 8.0, y),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{}", row.rank),
-                        egui::FontId::monospace(13.0),
-                        num_color,
-                    );
-                    ui.painter().text(
-                        egui::pos2(rect.left() + 56.0, y),
-                        egui::Align2::LEFT_CENTER,
-                        &row.code,
-                        egui::FontId::monospace(13.0),
-                        INK,
-                    );
-                    let name = if row.name.is_empty() {
-                        "—"
-                    } else {
-                        row.name.as_str()
-                    };
-                    ui.painter().text(
-                        egui::pos2(rect.left() + 140.0, y),
-                        egui::Align2::LEFT_CENTER,
-                        name,
-                        egui::FontId::proportional(13.0),
-                        INK,
-                    );
-                    ui.painter().text(
-                        egui::pos2(rect.left() + 280.0, y),
-                        egui::Align2::LEFT_CENTER,
-                        &row.value_text,
-                        egui::FontId::proportional(13.0),
-                        if is_origin { ACCENT } else { INK },
-                    );
-                    if resp.clicked() {
-                        jump = Some(row.code.clone());
-                    }
-                }
+                });
             });
+
+        ui.add_space(6.0);
+
+        let table_w = ui.available_width().max(480.0);
+        let col_rank = 44.0;
+        let col_code = 84.0;
+        let col_name = (table_w * 0.22).clamp(96.0, 180.0);
+        let col_val = (table_w - col_rank - col_code - col_name - 16.0).max(120.0);
+        let row_h = 32.0;
+        let n = board.rows.len();
+        // 整块表格占满主区剩余高度，避免 Frame 被列表撑开只剩一行可视区。
+        let block_h = ui.available_height().max(320.0);
+        ui.allocate_ui(egui::vec2(table_w, block_h), |ui| {
+            ui.set_min_size(egui::vec2(table_w, block_h));
+            egui::Frame::none()
+                .fill(SURFACE)
+                .stroke(egui::Stroke::new(1.0, LINE))
+                .rounding(egui::Rounding::same(4.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [col_rank, 22.0],
+                            egui::Label::new(egui::RichText::new("#").size(12.0).color(DIM)),
+                        );
+                        ui.add_sized(
+                            [col_code, 22.0],
+                            egui::Label::new(egui::RichText::new("代码").size(12.0).color(DIM)),
+                        );
+                        ui.add_sized(
+                            [col_name, 22.0],
+                            egui::Label::new(egui::RichText::new("名称").size(12.0).color(DIM)),
+                        );
+                        ui.add_sized(
+                            [col_val, 22.0],
+                            egui::Label::new(egui::RichText::new(&board.label).size(12.0).color(DIM)),
+                        );
+                    });
+                    ui.separator();
+                    let list_h = ui.available_height().max(200.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("rank_rows")
+                        .auto_shrink([false, false])
+                        .max_height(list_h)
+                        .show_rows(ui, row_h, n, |ui, range| {
+                            for i in range {
+                                let row = &board.rows[i];
+                                let is_origin = row.code == origin_code;
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width().max(table_w), row_h),
+                                    egui::Sense::click(),
+                                );
+                                if is_origin {
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        2.0,
+                                        egui::Color32::from_rgba_unmultiplied(13, 148, 136, 48),
+                                    );
+                                } else if i % 2 == 1 {
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        0.0,
+                                        egui::Color32::from_rgba_unmultiplied(248, 250, 251, 255),
+                                    );
+                                } else if resp.hovered() {
+                                    ui.painter().rect_filled(rect, 2.0, SURFACE);
+                                }
+                                let y = rect.center().y;
+                                let num_color = if is_origin { ACCENT } else { DIM };
+                                let x0 = rect.left();
+                                ui.painter().text(
+                                    egui::pos2(x0 + 10.0, y),
+                                    egui::Align2::LEFT_CENTER,
+                                    format!("{}", row.rank),
+                                    egui::FontId::monospace(13.0),
+                                    num_color,
+                                );
+                                ui.painter().text(
+                                    egui::pos2(x0 + col_rank + 4.0, y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &row.code,
+                                    egui::FontId::monospace(13.0),
+                                    INK,
+                                );
+                                let name = if row.name.is_empty() {
+                                    "—"
+                                } else {
+                                    row.name.as_str()
+                                };
+                                ui.painter().text(
+                                    egui::pos2(x0 + col_rank + col_code + 4.0, y),
+                                    egui::Align2::LEFT_CENTER,
+                                    name,
+                                    egui::FontId::proportional(13.0),
+                                    INK,
+                                );
+                                ui.painter().text(
+                                    egui::pos2(x0 + col_rank + col_code + col_name + 4.0, y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &row.value_text,
+                                    egui::FontId::proportional(13.0),
+                                    if is_origin { ACCENT } else { INK },
+                                );
+                                if resp.clicked() {
+                                    jump = Some(row.code.clone());
+                                }
+                            }
+                        });
+                });
+        });
 
         if let Some(asc) = set_asc {
             let id = board.spec_id.clone();
@@ -1823,6 +1900,7 @@ impl App for CrawlerApp {
                 if self.main_tab == 1 {
                     let body = ui.available_size();
                     ui.allocate_ui(body, |ui| {
+                        ui.set_min_size(body);
                         if self.lookup_page == LookupPage::Rank {
                             self.ui_stock_lookup(ui);
                         } else {
