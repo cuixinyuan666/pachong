@@ -6,6 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::collections::VecDeque;
+use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
+use std::process::Command;
 
 use crate::http::{crawl_one, RateLimiter};
 use crate::models::StockRef;
@@ -45,6 +48,9 @@ const MAX_COOLDOWNS: usize = 12;
 /// 同时抓取路数；遇 403 降到 4 再降到 1。
 const MAX_WORKERS: usize = 16;
 const RAMP_OK: usize = 24;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+/// 脚本/Python/selenium 不可用时不再反复调用，避免日志刷 Traceback。
+static SELENIUM_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
 struct Pace {
     max_inflight: usize,
@@ -124,42 +130,181 @@ fn acquire_slot(
     }
 }
 
-/// 对齐 Python：调用同目录 baidu_selenium_fallback.refresh_and_apply()
+/// 403 后用无头 Chrome 刷新 Cookie。脚本打进 exe，需要时写到 exe 同目录。
 fn try_selenium_cookie_refresh(log: &dyn Fn(&str)) -> bool {
-    let py = std::env::var("PYTHON").unwrap_or_else(|_| "python".to_string());
-    let script = format!(
-        "import sys; sys.path.insert(0, r'{}'); from baidu_selenium_fallback import refresh_and_apply; c=refresh_and_apply(); print('OK' if c else 'FAIL'); print(len(c or {{}}))",
-        crate::settings::workspace_dir()
-    );
-    match std::process::Command::new(&py)
-        .args(["-c", &script])
-        .current_dir(crate::settings::workspace_dir())
-        .output()
-    {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.trim().is_empty() {
-                log(&format!("[B/Selenium stderr] {}", stderr.chars().take(300).collect::<String>()));
-            }
-            if stdout.contains("OK") {
-                let path = format!("{}/baidu_cookies.json", crate::settings::workspace_dir());
-                if let Some(c) = crate::http::load_cookies_from_json_file(&path) {
-                    crate::http::set_live_cookie_header(&c);
-                    true
-                } else {
-                    log("[B] Selenium 成功但未读到 baidu_cookies.json");
-                    false
-                }
-            } else {
-                log(&format!("[B] Selenium 未成功: {}", stdout.chars().take(200).collect::<String>()));
-                false
-            }
+    if SELENIUM_UNAVAILABLE.load(Ordering::SeqCst) {
+        log("[B] 已跳过 Selenium（本机装不上 Python），只冷却降速");
+        return false;
+    }
+    let Some(script) = ensure_selenium_script(log) else {
+        SELENIUM_UNAVAILABLE.store(true, Ordering::SeqCst);
+        return false;
+    };
+    if python_bin().is_none() {
+        log("[B] 未找到 Python，正在尝试自动安装（winget，当前用户）…");
+        if !try_install_python(log) {
+            log("[B] 自动安装 Python 失败。需要已装 Chrome。也可手动安装 Python 后重试。");
+            SELENIUM_UNAVAILABLE.store(true, Ordering::SeqCst);
+            return false;
         }
+    }
+    let output = match run_selenium_script(&script) {
+        Ok(o) => o,
         Err(e) => {
-            log(&format!("[B] 无法启动 Python Selenium: {}", e));
+            log(&format!("[B] 无法启动 Python: {e}"));
+            SELENIUM_UNAVAILABLE.store(true, Ordering::SeqCst);
+            return false;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stdout.contains("AUTO_PIP") {
+        log("[B] 正在自动安装 selenium / webdriver-manager…");
+    }
+    let err_tail = stderr_tail(&stderr, 400);
+    if !err_tail.is_empty() {
+        log(&format!("[B/Selenium stderr] {err_tail}"));
+    }
+    if stdout.contains("OK") {
+        let path = format!("{}/baidu_cookies.json", crate::settings::workspace_dir());
+        if let Some(c) = crate::http::load_cookies_from_json_file(&path) {
+            crate::http::set_live_cookie_header(&c);
+            true
+        } else {
+            log("[B] Selenium 成功但未读到 baidu_cookies.json");
             false
         }
+    } else {
+        log(&format!(
+            "[B] Selenium 未拿到 Cookie: {}",
+            stdout.chars().take(200).collect::<String>()
+        ));
+        false
+    }
+}
+
+fn ensure_selenium_script(log: &dyn Fn(&str)) -> Option<PathBuf> {
+    let dest = PathBuf::from(crate::settings::workspace_dir()).join("baidu_selenium_fallback.py");
+    const SRC: &str = include_str!("../../baidu_selenium_fallback.py");
+    match std::fs::write(&dest, SRC) {
+        Ok(()) => Some(dest),
+        Err(e) => {
+            log(&format!("无法写出 baidu_selenium_fallback.py: {e}"));
+            None
+        }
+    }
+}
+
+fn python_looks_ok(out: &std::process::Output) -> bool {
+    if !out.status.success() {
+        return false;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.contains("3.")
+}
+
+fn probe_python(bin: &str, extra: &[String]) -> bool {
+    let mut cmd = Command::new(bin);
+    for a in extra {
+        cmd.arg(a);
+    }
+    cmd.arg("-c")
+        .arg("import sys; print(sys.version)")
+        .creation_flags(CREATE_NO_WINDOW);
+    cmd.output().ok().filter(python_looks_ok).is_some()
+}
+
+fn known_python_exes() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        for ver in ["Python314", "Python313", "Python312", "Python311", "Python310"] {
+            v.push(
+                PathBuf::from(&local)
+                    .join("Programs")
+                    .join("Python")
+                    .join(ver)
+                    .join("python.exe"),
+            );
+        }
+    }
+    v.push(PathBuf::from(r"C:\Python312\python.exe"));
+    v.push(PathBuf::from(r"C:\Python313\python.exe"));
+    v
+}
+
+/// 返回 (解释器路径或命令名, 额外参数如 py -3)
+fn python_bin() -> Option<(String, Vec<String>)> {
+    for p in known_python_exes() {
+        if p.is_file() {
+            let s = p.to_string_lossy().to_string();
+            if probe_python(&s, &[]) {
+                return Some((s, Vec::new()));
+            }
+        }
+    }
+    let named: [(&str, &[&str]); 3] = [
+        ("py", &["-3"]),
+        ("python3", &[]),
+        ("python", &[]),
+    ];
+    for (bin, prefix) in named {
+        let extra: Vec<String> = prefix.iter().map(|x| (*x).to_string()).collect();
+        if probe_python(bin, &extra) {
+            return Some((bin.to_string(), extra));
+        }
+    }
+    None
+}
+
+fn try_install_python(log: &dyn Fn(&str)) -> bool {
+    let mut cmd = Command::new("winget");
+    cmd.args([
+        "install",
+        "-e",
+        "--id",
+        "Python.Python.3.12",
+        "--scope",
+        "user",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+        "--disable-interactivity",
+    ])
+    .creation_flags(CREATE_NO_WINDOW);
+    match cmd.status() {
+        Ok(s) => {
+            log(&format!("[B] winget 安装 Python 结束，退出码 {:?}", s.code()));
+        }
+        Err(e) => {
+            log(&format!("[B] 没有 winget，无法自动装 Python: {e}"));
+            return python_bin().is_some();
+        }
+    }
+    python_bin().is_some()
+}
+
+fn run_selenium_script(script: &PathBuf) -> Result<std::process::Output, String> {
+    let path = script.to_string_lossy().to_string();
+    let (bin, extra) = python_bin().ok_or_else(|| "未找到 python".to_string())?;
+    let mut cmd = Command::new(&bin);
+    for a in &extra {
+        cmd.arg(a);
+    }
+    cmd.arg(&path)
+        .current_dir(crate::settings::workspace_dir())
+        .creation_flags(CREATE_NO_WINDOW);
+    cmd.output().map_err(|e| format!("{bin}: {e}"))
+}
+
+fn stderr_tail(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = t.chars().collect();
+    if chars.len() <= max {
+        t.to_string()
+    } else {
+        chars[chars.len() - max..].iter().collect()
     }
 }
 
@@ -719,9 +864,12 @@ fn handle_403(
         if refreshed {
             log("[B] Cookie 已刷新，5 秒后继续");
             thread::sleep(Duration::from_secs(5));
-        } else if long_cool {
-            log(&format!("[B] 刷新失败，冷却 {:.0}s", COOLDOWN_SEC));
-            let mut remaining = COOLDOWN_SEC;
+        } else {
+            let cool = if long_cool { COOLDOWN_SEC } else { 60.0 };
+            log(&format!(
+                "[B] 刷新失败或不可用，冷却 {cool:.0}s 后再用当前路数继续（不要反复弹 Python 报错）"
+            ));
+            let mut remaining = cool;
             while remaining > 0.0 {
                 if stop.load(Ordering::SeqCst) {
                     break;
@@ -732,8 +880,9 @@ fn handle_403(
                     st.cooldown_remaining = remaining;
                 }
             }
-        } else {
-            thread::sleep(Duration::from_secs(20));
+            if let Ok(mut p) = pace.lock() {
+                p.pause_until = Instant::now() + Duration::from_secs(5);
+            }
         }
         if let Ok(mut p) = pace.lock() {
             p.refreshing = false;

@@ -5,12 +5,15 @@
 
 在 C 方案（Cookie/冷却）连续 403 后调用：无头 Chrome 访问百度财经，
 提取 Cookie，写回 cookie 池与调用方，供后续 curl/urllib 继续抓取。
+另一台电脑没有 selenium 时会自动 pip 安装。
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import subprocess
+import sys
 import time
 from typing import Optional
 
@@ -18,9 +21,10 @@ logger = logging.getLogger("baidu_selenium_fallback")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 COOKIE_CACHE = os.path.join(HERE, "baidu_cookies.json")
+PIP_PKGS = ("selenium", "webdriver-manager")
 
 
-def _ensure_selenium() -> bool:
+def _try_import_selenium() -> bool:
     try:
         import selenium  # noqa: F401
         from webdriver_manager.chrome import ChromeDriverManager  # noqa: F401
@@ -29,11 +33,41 @@ def _ensure_selenium() -> bool:
         return False
 
 
+def _pip(args: list) -> bool:
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", *args],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_selenium() -> bool:
+    """没有 selenium 就自动 pip 装上。"""
+    if _try_import_selenium():
+        return True
+    print("AUTO_PIP", flush=True)
+    if not _pip(["install", "-q", *PIP_PKGS]):
+        subprocess.run(
+            [sys.executable, "-m", "ensurepip", "--upgrade"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        _pip(["install", "--upgrade", "pip"])
+        if not _pip(["install", "-q", *PIP_PKGS]):
+            logger.error("自动 pip 安装 selenium / webdriver-manager 失败")
+            return False
+    return _try_import_selenium()
+
+
 def refresh_cookies_headless(timeout_page: float = 8.0) -> Optional[dict]:
     """Headless Chrome 访问百度财经并返回 Cookie dict；失败返回 None。"""
     if not _ensure_selenium():
-        logger.error("未安装 selenium / webdriver-manager，无法执行 B 方案。"
-                     "请运行: pip install selenium webdriver-manager")
+        logger.error("自动安装 selenium 失败，无法刷新 Cookie")
         return None
 
     from selenium import webdriver
@@ -125,7 +159,6 @@ def apply_cookies_to_runtime(cookies: dict) -> None:
         logger.info("[B/Selenium] 已写入 Cookie 池")
     except Exception as e:
         logger.warning("[B/Selenium] 写入 Cookie 池失败: %s", e)
-    # 供同进程内依赖环境变量的逻辑使用
     os.environ["_BAIDU_COOKIE_DICT"] = json.dumps(cookies, ensure_ascii=False)
 
 
@@ -135,3 +168,9 @@ def refresh_and_apply() -> Optional[dict]:
     if cookies:
         apply_cookies_to_runtime(cookies)
     return cookies
+
+
+if __name__ == "__main__":
+    c = refresh_and_apply()
+    print("OK" if c else "FAIL")
+    print(len(c or {}))

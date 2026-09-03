@@ -28,6 +28,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item rust_crawler/target/release/baidu_finance_rust.exe dist/baidu_finance_rust-windows-x64.exe
+          Copy-Item baidu_selenium_fallback.py dist/baidu_selenium_fallback.py
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -39,6 +40,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/baidu_finance_rust-windows-x64.exe
+          files: |
+            dist/baidu_finance_rust-windows-x64.exe
+            dist/baidu_selenium_fallback.py
           generate_release_notes: true
           fail_on_unmatched_files: true
