@@ -15,6 +15,7 @@ mod checklist;
 mod em_crawler;
 mod verify;
 mod telegram;
+mod lookup;
 
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -110,6 +111,13 @@ struct CrawlerApp {
     tg_chat: String,
     show_tg_help: bool,
     tg_thread: Option<thread::JoinHandle<()>>,
+    /// 个股查询输入框（6 位代码）。
+    lookup_code: String,
+    /// 最近一次查询结果。
+    lookup: Option<crate::lookup::StockSnapshot>,
+    lookup_err: String,
+    /// 主区：0=抓取进度 1=个股查询。
+    main_tab: usize,
 }
 
 impl Default for CrawlerApp {
@@ -164,6 +172,10 @@ impl Default for CrawlerApp {
             tg_chat: crate::telegram::load().chat_id,
             show_tg_help: false,
             tg_thread: None,
+            lookup_code: String::new(),
+            lookup: None,
+            lookup_err: String::new(),
+            main_tab: 0,
         }
     }
 }
@@ -602,6 +614,147 @@ impl CrawlerApp {
         self.crawler_thread = Some(handle);
     }
 
+    /// 按左侧/主区输入的代码查库，切到「个股查询」页。
+    fn run_stock_lookup(&mut self) {
+        self.lookup_err.clear();
+        self.main_tab = 1;
+        match crate::lookup::lookup_stock(&self.db_path_input, &self.lookup_code) {
+            Ok(mut snap) => {
+                if snap.name.is_empty() {
+                    let code = snap.code.clone();
+                    if let Some(s) = load_codes().into_iter().find(|s| s.code == code) {
+                        snap.name = s.name;
+                    }
+                }
+                self.lookup = Some(snap);
+            }
+            Err(e) => {
+                self.lookup = None;
+                self.lookup_err = e;
+            }
+        }
+    }
+
+    /// 主区个股查询：分组卡片 + 两列标签/值，长文整行折行。
+    fn ui_stock_lookup(&mut self, ui: &mut egui::Ui) {
+        let mut do_query = false;
+        let mut do_copy = false;
+        panel(ui, "按代码查询", |ui| {
+            ui.colored_label(DIM, "查的是本地库里该股各表最新一行，不是实时行情。代码可写 1、000001、000001.SZ。");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.lookup_code)
+                        .desired_width(140.0)
+                        .hint_text("如 000001")
+                        .font(egui::TextStyle::Monospace),
+                );
+                if ui.button("查询").clicked()
+                    || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                {
+                    do_query = true;
+                }
+                if ui
+                    .add_enabled(self.lookup.is_some(), egui::Button::new("复制全部"))
+                    .clicked()
+                {
+                    do_copy = true;
+                }
+            });
+        });
+        if do_query {
+            self.run_stock_lookup();
+        }
+        if do_copy {
+            if let Some(s) = &self.lookup {
+                ui.ctx().copy_text(s.as_text());
+            }
+        }
+        ui.add_space(10.0);
+        if !self.lookup_err.is_empty() {
+            ui.colored_label(DANGER, &self.lookup_err);
+            return;
+        }
+        let Some(snap) = self.lookup.as_ref() else {
+            ui.colored_label(DIM, "在上方或左侧输入股票代码后点查询，这里按分组列出该股全部字段。");
+            return;
+        };
+
+        egui::Frame::none()
+            .fill(SURFACE)
+            .stroke(egui::Stroke::new(1.0, LINE))
+            .rounding(egui::Rounding::same(4.0))
+            .inner_margin(egui::Margin::symmetric(20.0, 16.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        INK,
+                        egui::RichText::new(&snap.code).size(28.0).strong().monospace(),
+                    );
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.colored_label(
+                            INK,
+                            egui::RichText::new(if snap.name.is_empty() {
+                                "—"
+                            } else {
+                                snap.name.as_str()
+                            })
+                            .size(20.0)
+                            .strong(),
+                        );
+                        ui.colored_label(
+                            if snap.found { DIM } else { WARN },
+                            &snap.hint,
+                        );
+                    });
+                });
+            });
+
+        ui.add_space(12.0);
+        if snap.sections.is_empty() {
+            return;
+        }
+        for sec in &snap.sections {
+            panel(ui, &sec.title, |ui| {
+                if sec.wide {
+                    for f in &sec.rows {
+                        ui.colored_label(DIM, egui::RichText::new(&f.label).size(11.0));
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&f.value).size(13.0).color(INK))
+                                .wrap(),
+                        );
+                        ui.add_space(8.0);
+                    }
+                } else {
+                    egui::Grid::new(format!("lookup_{}", sec.title))
+                        .num_columns(4)
+                        .min_col_width(72.0)
+                        .spacing([14.0, 8.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (i, f) in sec.rows.iter().enumerate() {
+                                ui.colored_label(DIM, egui::RichText::new(&f.label).size(12.0));
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&f.value).size(13.0).color(INK).strong(),
+                                    )
+                                    .wrap(),
+                                );
+                                if i % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
+                            if sec.rows.len() % 2 == 1 {
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
+            ui.add_space(10.0);
+        }
+    }
+
     /// 出错弹窗：必须点确认/重试/停止；打开源站只开浏览器，不替你点确认。
     fn show_error_dialog(&mut self, ctx: &egui::Context, notice: &ErrorNotice) {
         let title = format!("请确认 · {}", notice.kind);
@@ -839,7 +992,11 @@ impl App for CrawlerApp {
                         );
                         ui.colored_label(
                             egui::Color32::from_rgb(148, 173, 184),
-                            egui::RichText::new("A股全市场数据采集控制台").size(11.0),
+                            egui::RichText::new(format!(
+                                "A股全市场数据采集控制台  v{}",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .size(11.0),
                         );
                     });
                     ui.add_space(16.0);
@@ -1198,6 +1355,38 @@ impl App for CrawlerApp {
                         });
 
                         ui.add_space(8.0);
+                        panel(ui, "查询个股", |ui| {
+                            ui.colored_label(DIM, "输入代码，主区展示库内该股全部字段");
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.lookup_code)
+                                        .desired_width(88.0)
+                                        .hint_text("如 000001")
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                                if ui.button("查询").clicked()
+                                    || (resp.has_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                {
+                                    self.run_stock_lookup();
+                                }
+                            });
+                            if !self.lookup_err.is_empty() {
+                                ui.colored_label(DANGER, self.lookup_err.as_str());
+                            } else if let Some(s) = &self.lookup {
+                                ui.colored_label(
+                                    if s.found { OK } else { WARN },
+                                    format!(
+                                        "{} {}",
+                                        s.code,
+                                        if s.name.is_empty() { "—" } else { s.name.as_str() }
+                                    ),
+                                );
+                            }
+                        });
+
+                        ui.add_space(8.0);
                         panel(ui, "数据质量", |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 if ui
@@ -1230,7 +1419,7 @@ impl App for CrawlerApp {
                     });
             });
 
-        // —— 主区：会话进度（签名元素：大号完成率） ——
+        // —— 主区：抓取进度 / 个股查询 ——
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -1238,7 +1427,32 @@ impl App for CrawlerApp {
                     .inner_margin(egui::Margin::symmetric(20.0, 16.0)),
             )
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.main_tab == 0, "抓取进度")
+                        .clicked()
+                    {
+                        self.main_tab = 0;
+                    }
+                    if ui
+                        .selectable_label(self.main_tab == 1, "个股查询")
+                        .clicked()
+                    {
+                        self.main_tab = 1;
+                    }
+                });
+                ui.add_space(10.0);
+                if self.main_tab == 1 {
+                    egui::ScrollArea::vertical()
+                        .id_salt("lookup_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.ui_stock_lookup(ui);
+                        });
+                    return;
+                }
                 egui::ScrollArea::vertical()
+                    .id_salt("progress_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         // Signature: session completion meter
