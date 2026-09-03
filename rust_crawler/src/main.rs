@@ -1002,6 +1002,10 @@ impl App for CrawlerApp {
                                 );
                                 ui.checkbox(&mut self.force_input, "强制非交易日");
                             });
+                            ui.colored_label(
+                                DIM,
+                                "默认 16 路同时抓。遇 403 自动降到 4/1 路。自动模式若探测到 VPN/系统代理，一半走代理一半直连。",
+                            );
                         });
 
                         ui.add_space(8.0);
@@ -1458,6 +1462,7 @@ impl App for CrawlerApp {
                     ui.label("3) 必须翻墙才能到源站时，先打开 VPN/Clash 的系统代理，再选「走系统代理」。");
                     ui.label("4) 点「重新探测」会立刻打百度财经和东财。失败会弹窗，可点源站链接核对。");
                     ui.label("5) 浏览器能开、程序提示 DNS/resolve：浏览器可能开了安全 DNS，本机 DNS 还是 VPN 的。可在网卡里改 DNS，或 ipconfig /flushdns。");
+                    ui.label("6) 抓取默认 16 路同时进行。自动模式探测到 VPN/Clash 系统代理还活着：一半请求走代理、一半直连（两个出口）。遇 403 会降到 4 路再降到 1 路，连续成功后再加回去。");
                 });
             if !open {
                 self.show_net_help = false;

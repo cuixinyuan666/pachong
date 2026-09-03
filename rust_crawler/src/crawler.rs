@@ -1,9 +1,11 @@
 //! 爬虫引擎：遍历内置代码清单，逐支抓取并落库。
 //! 含：断点续跑（跳过已存在的 trade_date+code）、连续 403 自动长冷却（自愈）、限流、统计与状态上报。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 
 use crate::http::{crawl_one, RateLimiter};
 use crate::models::StockRef;
@@ -40,6 +42,87 @@ pub struct CrawlConfig {
 const CONSEC_403_THRESHOLD: usize = 8;
 const COOLDOWN_SEC: f64 = 600.0;
 const MAX_COOLDOWNS: usize = 12;
+/// 同时抓取路数；遇 403 降到 4 再降到 1。
+const MAX_WORKERS: usize = 16;
+const RAMP_OK: usize = 24;
+
+struct Pace {
+    max_inflight: usize,
+    inflight: usize,
+    pause_until: Instant,
+    proxy_pause: Instant,
+    direct_pause: Instant,
+    consec_403: usize,
+    consec_ok: usize,
+    cooldown_rounds: usize,
+    refreshing: bool,
+}
+
+struct InflightSlot {
+    pace: Arc<Mutex<Pace>>,
+}
+
+impl Drop for InflightSlot {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.pace.lock() {
+            g.inflight = g.inflight.saturating_sub(1);
+        }
+    }
+}
+
+fn is_403(msg: &str) -> bool {
+    msg.contains("403") || msg.contains("Forbidden") || msg.contains("CHALLENGE") || msg.contains("验证")
+}
+
+fn acquire_slot(
+    pace: &Arc<Mutex<Pace>>,
+    stop: &AtomicBool,
+    use_proxy: bool,
+    serial_interval: f64,
+) -> Option<InflightSlot> {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        let now = Instant::now();
+        let (need_wait, got) = {
+            let mut g = match pace.lock() {
+                Ok(g) => g,
+                Err(_) => return None,
+            };
+            let path_pause = if use_proxy { g.proxy_pause } else { g.direct_pause };
+            let until = if g.pause_until > path_pause {
+                g.pause_until
+            } else {
+                path_pause
+            };
+            if now < until {
+                (Some(until.saturating_duration_since(now)), false)
+            } else if g.inflight < g.max_inflight {
+                g.inflight += 1;
+                let serial = g.max_inflight == 1;
+                (if serial && serial_interval > 0.0 {
+                    Some(Duration::from_secs_f64(serial_interval))
+                } else {
+                    None
+                }, true)
+            } else {
+                (Some(Duration::from_millis(20)), false)
+            }
+        };
+        if got {
+            if let Some(d) = need_wait {
+                thread::sleep(d);
+            }
+            return Some(InflightSlot {
+                pace: pace.clone(),
+            });
+        }
+        if let Some(d) = need_wait {
+            thread::sleep(d.min(Duration::from_millis(200)));
+        }
+    }
+}
 
 /// 对齐 Python：调用同目录 baidu_selenium_fallback.refresh_and_apply()
 fn try_selenium_cookie_refresh(log: &dyn Fn(&str)) -> bool {
@@ -120,7 +203,7 @@ pub fn run_crawler(
     };
 
     // 单连接（WAL + busy_timeout），整轮抓取复用；Db::open 内部已建表。
-    let mut db = match db::Db::open(&config.db_path) {
+    let db = match db::Db::open(&config.db_path) {
         Ok(d) => d,
         Err(e) => {
             let detail = format!("打开数据库失败: {e}");
@@ -147,11 +230,11 @@ pub fn run_crawler(
         }
     };
 
-    // 单 HTTP 客户端：代理端口死了（VPN 已关）就直连，避免整表网络错误
-    let client = match crate::http::build_blocking_client(config.timeout) {
-        Ok(c) => {
-            log(&format!("HTTP 客户端就绪：{}", crate::http::last_proxy_desc()));
-            c
+    // 出口：自动模式且 VPN/系统代理活着时，一半走代理一半直连。
+    let exits = match crate::http::build_exit_clients(config.timeout) {
+        Ok(e) => {
+            log(&e.desc);
+            e
         }
         Err(e) => {
             log(&format!("HTTP 客户端创建失败: {}", e));
@@ -173,8 +256,10 @@ pub fn run_crawler(
             return;
         }
     };
-    // Cookie 预热（①）：先抓一次样本股落地页，让 Baidu 下发会话 cookie
-    crate::http::warm_up(&client, "600000");
+    if let Some(c) = &exits.proxy {
+        crate::http::warm_up(c, "600000");
+    }
+    crate::http::warm_up(&exits.direct, "600000");
     // 对齐 Python：环境变量 / baidu_cookies.json 注入 Cookie
     if let Ok(env_c) = std::env::var("_BAIDU_COOKIE_DICT") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&env_c) {
@@ -198,250 +283,20 @@ pub fn run_crawler(
     }
     log("HTTP 客户端就绪 (cookie_store 已开启, 已预热 cookie)");
 
-    let mut limiter = RateLimiter::new_ex(
-        config.min_interval,
-        config.max_per_minute,
-        config.jitter,
-        settings.pacing.interval_jitter_extra,
-        settings.pacing.micro_break_every,
-        settings.pacing.micro_break_min,
-        settings.pacing.micro_break_max,
-        config.rate_wait_cap,
-        60.0,
-    );
-
     let targets: Vec<StockRef> = match config.limit {
         Some(n) => config.codes.iter().take(n).cloned().collect(),
         None => config.codes.clone(),
     };
-    let total = targets.len();
-
-    {
-        if let Ok(mut st) = state.lock() {
-            st.total = total;
-            st.status = CrawlStatus::Running;
-            st.status_msg.clear();
-        }
-    }
-
-    let t0 = Instant::now();
-    let mut done = 0usize;
-    let mut skipped = 0usize;
-    let mut failed = 0usize;
-    let mut consecutive_403 = 0usize;
-    let mut cooldown_count = 0usize;
-
-    for (i, item) in targets.into_iter().enumerate() {
-        if stop.load(Ordering::SeqCst) {
-            if let Ok(mut st) = state.lock() {
-                st.status = CrawlStatus::Stopped;
-                st.status_msg = "用户中止".into();
-            }
-            break;
-        }
-
-        let code = item.code.clone();
-        let name = item.name.clone();
-
-        // 断点续跑：对齐 Python should_skip_code（ok 新鲜 / 空壳冷却）
-        if config.resume {
-            match db.should_skip(
-                &code,
-                "baidu",
-                config.fresh_days,
-                config.empty_limit,
-                config.empty_cooldown_days,
-            ) {
-                Ok(Some(reason)) => {
-                    skipped += 1;
-                    if reason == "empty_cooldown" {
-                        log(&format!("{} 空壳冷却跳过", code));
-                    }
-                    if let Ok(mut st) = state.lock() {
-                        st.skipped = skipped;
-                    }
-                    continue;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    log(&format!("DB 查询失败 {}: {}", code, e));
-                }
-            }
-        }
-
-        if let Ok(mut st) = state.lock() {
-            st.current_code = code.clone();
-            st.current_name = name.clone();
-        }
-
-        let single_start = Instant::now();
-        let stock = StockRef { code: code.clone(), name: name.clone() };
-
-        // 单只失败/不完整只记网页链接，不弹窗；整只循环里仍处理 403 冷却
-        loop {
-            if stop.load(Ordering::SeqCst) {
-                break;
-            }
-            let res = crawl_one(&client, &mut limiter, &stock, &config, &state);
-            match res {
-                Ok(parsed) => {
-                    let empty = parsed.scores.update_time.is_none();
-                    if empty {
-                        note_problem(
-                            &state,
-                            "未拿到数据",
-                            &code,
-                            &name,
-                            "本次未拿到数据（不是确认源站无数据）",
-                            &["baidu"],
-                        );
-                    }
-                    if let Err(e) = db.save_snapshot(&config.trade_date, &stock, &parsed) {
-                        note_problem(
-                            &state,
-                            "落库失败",
-                            &code,
-                            &name,
-                            &format!("保存失败: {e}"),
-                            &["baidu"],
-                        );
-                        failed += 1;
-                        let _ = db.bump_crawl_stats(&code, false, "fail");
-                    } else {
-                        done += 1;
-                        consecutive_403 = 0;
-                        if settings.check.check_after_each_stock {
-                            match db.completeness(&config.trade_date, &code) {
-                                Ok(c) => {
-                                    let missing = c.missing_vec();
-                                    let n = missing.len();
-                                    if n >= settings.check.missing_count_threshold {
-                                        let detail = format!(
-                                            "完整性缺 {} 项: {:?}",
-                                            n, missing
-                                        );
-                                        log(&format!("⚠ [完整性] {} ({}) {}", code, name, detail));
-                                        let prev = checklist.items.iter().find(|i| i.code == code);
-                                        let tries = prev.map(|i| i.tries).unwrap_or(0);
-                                        let last_try = prev.and_then(|i| i.last_try.clone());
-                                        let status = if tries >= settings.rescrape.max_tries {
-                                            CheckStatus::Exhausted
-                                        } else {
-                                            CheckStatus::Pending
-                                        };
-                                        checklist.upsert(CheckItem {
-                                            code: code.clone(),
-                                            name: name.clone(),
-                                            missing: missing.clone(),
-                                            missing_count: n,
-                                            tries,
-                                            last_try,
-                                            status,
-                                        });
-                                        note_problem(&state, "数据不完整", &code, &name, &detail, &["baidu"]);
-                                    }
-                                }
-                                Err(e) => {
-                                    note_problem(
-                                        &state,
-                                        "数据不完整",
-                                        &code,
-                                        &name,
-                                        &format!("完整性检查失败: {e}"),
-                                        &["baidu"],
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    break;
-                }
-                Err(e) => {
-                    let msg = e.clone();
-                    log(&format!("股票 {} 抓取失败: {}", code, e));
-                    note_problem(&state, "抓取失败", &code, &name, &msg, &["baidu"]);
-                    failed += 1;
-                    let _ = db.bump_crawl_stats(&code, false, "fail");
-                    if msg.contains("403") || msg.contains("Forbidden") || msg.contains("CHALLENGE") {
-                        consecutive_403 += 1;
-                        if consecutive_403 >= CONSEC_403_THRESHOLD {
-                            cooldown_count += 1;
-                            if cooldown_count > MAX_COOLDOWNS {
-                                if let Ok(mut st) = state.lock() {
-                                    st.status = CrawlStatus::Error;
-                                    st.status_msg = format!(
-                                        "连续冷却 {} 次仍遭 403，判定为持久封禁，停止。已完成 {} 跳过 {} 失败 {}",
-                                        MAX_COOLDOWNS, done, skipped, failed
-                                    );
-                                }
-                                stop.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                            if let Ok(mut st) = state.lock() {
-                                st.status = CrawlStatus::Cooling;
-                                st.status_msg = format!(
-                                    "连续 {} 支遭 403，C→B Selenium headless 刷新 Cookie (第 {}/{})",
-                                    consecutive_403, cooldown_count, MAX_COOLDOWNS
-                                );
-                                st.consecutive_403 = consecutive_403;
-                            }
-                            log("C 方案失效，切换 B 方案（调用 Python Selenium headless 刷新 Cookie）");
-                            let refreshed = try_selenium_cookie_refresh(&log);
-                            if refreshed {
-                                log("[B] Cookie 已刷新，5 秒后继续");
-                                std::thread::sleep(std::time::Duration::from_secs(5));
-                            } else {
-                                log(&format!("[B] 刷新失败，回退冷却 {:.0}s", COOLDOWN_SEC));
-                                let mut remaining = COOLDOWN_SEC;
-                                while remaining > 0.0 {
-                                    if stop.load(Ordering::SeqCst) {
-                                        break;
-                                    }
-                                    let step = remaining.min(1.0);
-                                    std::thread::sleep(std::time::Duration::from_secs_f64(step));
-                                    remaining -= step;
-                                    if let Ok(mut st) = state.lock() {
-                                        st.cooldown_remaining = remaining;
-                                    }
-                                }
-                            }
-                            consecutive_403 = 0;
-                            if let Ok(mut st) = state.lock() {
-                                st.cooldown_remaining = 0.0;
-                                if !stop.load(Ordering::SeqCst) {
-                                    st.status = CrawlStatus::Running;
-                                }
-                            }
-                        }
-                    } else {
-                        consecutive_403 = 0;
-                    }
-                    break;
-                }
-            }
-        }
-
-        let elapsed = t0.elapsed().as_secs_f64();
-        let processed = done + failed;
-        let avg = if processed > 0 { elapsed / processed as f64 } else { 0.0 };
-        let remain = total.saturating_sub(done + skipped + failed);
-        let eta = if avg > 0.0 { avg * remain as f64 } else { 0.0 };
-        if let Ok(mut st) = state.lock() {
-            st.done = done;
-            st.failed = failed;
-            st.total_elapsed = elapsed;
-            st.avg_per_stock = avg;
-            st.eta_secs = eta;
-            st.single_elapsed = single_start.elapsed().as_secs_f64();
-        }
-
-        if (i + 1) % 50 == 0 {
-            log(&format!(
-                "[{}/{}] 完成 {} 跳过 {} 失败 {} 用时 {:.0}s",
-                i + 1, total, done, skipped, failed, elapsed
-            ));
-        }
-    }
+    let (done, skipped, failed) = crawl_baidu_parallel(
+        &config,
+        &state,
+        &stop,
+        settings,
+        checklist,
+        db,
+        exits,
+        targets,
+    );
 
     if let Ok(mut st) = state.lock() {
         if st.status != CrawlStatus::Error && st.status != CrawlStatus::Stopped {
@@ -474,4 +329,422 @@ pub fn run_crawler(
         "===== 全市场抓取结束 新增 {} 跳过 {} 失败 {} =====",
         done, skipped, failed
     ));
+}
+
+fn crawl_baidu_parallel(
+    config: &CrawlConfig,
+    state: &Arc<Mutex<AppState>>,
+    stop: &Arc<AtomicBool>,
+    settings: &Settings,
+    checklist: &mut CheckList,
+    db: db::Db,
+    exits: crate::http::ExitClients,
+    targets: Vec<StockRef>,
+) -> (usize, usize, usize) {
+    let log = |s: &str| {
+        if let Ok(mut st) = state.lock() {
+            st.push_log(s.to_string());
+        }
+    };
+    let total = targets.len();
+    let db = Arc::new(Mutex::new(db));
+    let cl = Arc::new(Mutex::new(std::mem::take(checklist)));
+
+    let mut todo = VecDeque::new();
+    let mut skipped = 0usize;
+    {
+        let dbg = match db.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                log("数据库锁失败");
+                return (0, 0, total);
+            }
+        };
+        for item in targets {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if config.resume {
+                match dbg.should_skip(
+                    &item.code,
+                    "baidu",
+                    config.fresh_days,
+                    config.empty_limit,
+                    config.empty_cooldown_days,
+                ) {
+                    Ok(Some(reason)) => {
+                        skipped += 1;
+                        if reason == "empty_cooldown" {
+                            log(&format!("{} 空壳冷却跳过", item.code));
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => log(&format!("DB 查询失败 {}: {}", item.code, e)),
+                }
+            }
+            todo.push_back(item);
+        }
+    }
+
+    if let Ok(mut st) = state.lock() {
+        st.total = total;
+        st.skipped = skipped;
+        st.status = CrawlStatus::Running;
+        st.status_msg = format!("{}路并发 {}", MAX_WORKERS, exits.desc);
+    }
+    log(&format!(
+        "开始并发抓取：{}路，待抓 {} 已跳过 {}。{}",
+        MAX_WORKERS,
+        todo.len(),
+        skipped,
+        exits.desc
+    ));
+    log("16路时不按「间隔/上限」排队；遇 403 降到 4 路再降到 1 路（1 路时才恢复间隔）。连续成功后再加回去。");
+
+    let queue = Arc::new(Mutex::new(todo));
+    let done_n = Arc::new(AtomicUsize::new(0));
+    let fail_n = Arc::new(AtomicUsize::new(0));
+    let t0 = Instant::now();
+    let now0 = Instant::now();
+    let pace = Arc::new(Mutex::new(Pace {
+        max_inflight: MAX_WORKERS,
+        inflight: 0,
+        pause_until: now0,
+        proxy_pause: now0,
+        direct_pause: now0,
+        consec_403: 0,
+        consec_ok: 0,
+        cooldown_rounds: 0,
+        refreshing: false,
+    }));
+
+    let check_after = settings.check.check_after_each_stock;
+    let miss_th = settings.check.missing_count_threshold;
+    let max_tries = settings.rescrape.max_tries;
+    let serial_interval = config.min_interval;
+
+    let mut handles = Vec::new();
+    for w in 0..MAX_WORKERS {
+        let (client, use_proxy) = if exits.dual {
+            if w % 2 == 0 {
+                (
+                    exits
+                        .proxy
+                        .clone()
+                        .unwrap_or_else(|| exits.direct.clone()),
+                    true,
+                )
+            } else {
+                (exits.direct.clone(), false)
+            }
+        } else if let Some(p) = &exits.proxy {
+            (p.clone(), true)
+        } else {
+            (exits.direct.clone(), false)
+        };
+        let tag = if use_proxy { "代理" } else { "直连" };
+        let queue = queue.clone();
+        let db = db.clone();
+        let cl = cl.clone();
+        let done_n = done_n.clone();
+        let fail_n = fail_n.clone();
+        let pace = pace.clone();
+        let state = state.clone();
+        let stop = stop.clone();
+        let config = config.clone();
+        handles.push(thread::spawn(move || {
+            let mut limiter = RateLimiter::new_ex(
+                0.0, 1_000_000, 0.0, 0.0, 0, 0.0, 0.0, Some(0.0), 1.0,
+            );
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Some(_slot) = acquire_slot(&pace, &stop, use_proxy, serial_interval) else {
+                    break;
+                };
+                let stock = {
+                    let mut q = match queue.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    q.pop_front()
+                };
+                let Some(stock) = stock else { break };
+                let code = stock.code.clone();
+                let name = stock.name.clone();
+                if let Ok(mut st) = state.lock() {
+                    st.current_code = code.clone();
+                    st.current_name = name.clone();
+                }
+                let single_start = Instant::now();
+                let res = crawl_one(&client, &mut limiter, &stock, &config, &state);
+                match res {
+                    Ok(parsed) => {
+                        let empty = parsed.scores.update_time.is_none();
+                        if empty {
+                            note_problem(
+                                &state,
+                                "未拿到数据",
+                                &code,
+                                &name,
+                                "本次未拿到数据（不是确认源站无数据）",
+                                &["baidu"],
+                            );
+                        }
+                        let save_ok = {
+                            let mut dbg = match db.lock() {
+                                Ok(g) => g,
+                                Err(_) => {
+                                    fail_n.fetch_add(1, Ordering::SeqCst);
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = dbg.save_snapshot(&config.trade_date, &stock, &parsed) {
+                                note_problem(
+                                    &state,
+                                    "落库失败",
+                                    &code,
+                                    &name,
+                                    &format!("保存失败: {e}"),
+                                    &["baidu"],
+                                );
+                                let _ = dbg.bump_crawl_stats(&code, false, "fail");
+                                false
+                            } else {
+                                true
+                            }
+                        };
+                        if !save_ok {
+                            fail_n.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            done_n.fetch_add(1, Ordering::SeqCst);
+                            if let Ok(mut p) = pace.lock() {
+                                p.consec_403 = 0;
+                                p.consec_ok += 1;
+                                if p.consec_ok >= RAMP_OK && p.max_inflight < MAX_WORKERS {
+                                    let next = match p.max_inflight {
+                                        1 => 4,
+                                        4 => 8,
+                                        _ => MAX_WORKERS,
+                                    };
+                                    p.max_inflight = next;
+                                    p.consec_ok = 0;
+                                    if let Ok(mut st) = state.lock() {
+                                        st.push_log(format!("连续成功，恢复到 {next} 路并发"));
+                                        st.status_msg = format!("{next}路并发");
+                                        if st.status == CrawlStatus::Cooling {
+                                            st.status = CrawlStatus::Running;
+                                        }
+                                    }
+                                }
+                            }
+                            if check_after {
+                                if let Ok(dbg) = db.lock() {
+                                    match dbg.completeness(&config.trade_date, &code) {
+                                        Ok(c) => {
+                                            let missing = c.missing_vec();
+                                            let n = missing.len();
+                                            if n >= miss_th {
+                                                let detail =
+                                                    format!("完整性缺 {} 项: {:?}", n, missing);
+                                                if let Ok(mut st) = state.lock() {
+                                                    st.push_log(format!(
+                                                        "⚠ [完整性] {} ({}) {}",
+                                                        code, name, detail
+                                                    ));
+                                                }
+                                                if let Ok(mut list) = cl.lock() {
+                                                    let prev = list.items.iter().find(|i| i.code == code);
+                                                    let tries = prev.map(|i| i.tries).unwrap_or(0);
+                                                    let last_try = prev.and_then(|i| i.last_try.clone());
+                                                    let status = if tries >= max_tries {
+                                                        CheckStatus::Exhausted
+                                                    } else {
+                                                        CheckStatus::Pending
+                                                    };
+                                                    list.upsert(CheckItem {
+                                                        code: code.clone(),
+                                                        name: name.clone(),
+                                                        missing: missing.clone(),
+                                                        missing_count: n,
+                                                        tries,
+                                                        last_try,
+                                                        status,
+                                                    });
+                                                }
+                                                note_problem(
+                                                    &state,
+                                                    "数据不完整",
+                                                    &code,
+                                                    &name,
+                                                    &detail,
+                                                    &["baidu"],
+                                                );
+                                            }
+                                        }
+                                        Err(e) => note_problem(
+                                            &state,
+                                            "数据不完整",
+                                            &code,
+                                            &name,
+                                            &format!("完整性检查失败: {e}"),
+                                            &["baidu"],
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.clone();
+                        if let Ok(mut st) = state.lock() {
+                            st.push_log(format!("[{tag}] 股票 {code} 抓取失败: {e}"));
+                        }
+                        note_problem(&state, "抓取失败", &code, &name, &msg, &["baidu"]);
+                        fail_n.fetch_add(1, Ordering::SeqCst);
+                        if let Ok(dbg) = db.lock() {
+                            let _ = dbg.bump_crawl_stats(&code, false, "fail");
+                        }
+                        if is_403(&msg) {
+                            handle_403(&pace, &state, stop.as_ref(), use_proxy);
+                        } else if let Ok(mut p) = pace.lock() {
+                            p.consec_403 = 0;
+                        }
+                    }
+                }
+                let elapsed = t0.elapsed().as_secs_f64();
+                let done = done_n.load(Ordering::SeqCst);
+                let failed = fail_n.load(Ordering::SeqCst);
+                let processed = done + failed;
+                let avg = if processed > 0 {
+                    elapsed / processed as f64
+                } else {
+                    0.0
+                };
+                let remain = queue.lock().map(|q| q.len()).unwrap_or(0);
+                if let Ok(mut st) = state.lock() {
+                    st.done = done;
+                    st.failed = failed;
+                    st.total_elapsed = elapsed;
+                    st.avg_per_stock = avg;
+                    st.eta_secs = if avg > 0.0 { avg * remain as f64 } else { 0.0 };
+                    st.single_elapsed = single_start.elapsed().as_secs_f64();
+                    if let Ok(p) = pace.lock() {
+                        st.consecutive_403 = p.consec_403;
+                    }
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        let _ = h.join();
+    }
+    crate::http::set_direct_fallback(true);
+    if let Ok(g) = cl.lock() {
+        *checklist = g.clone();
+    }
+    (
+        done_n.load(Ordering::SeqCst),
+        skipped,
+        fail_n.load(Ordering::SeqCst),
+    )
+}
+
+fn handle_403(
+    pace: &Arc<Mutex<Pace>>,
+    state: &Arc<Mutex<AppState>>,
+    stop: &AtomicBool,
+    use_proxy: bool,
+) {
+    let log = |s: &str| {
+        if let Ok(mut st) = state.lock() {
+            st.push_log(s.to_string());
+        }
+    };
+    let mut do_refresh = false;
+    let mut long_cool = false;
+    {
+        let Ok(mut p) = pace.lock() else { return };
+        p.consec_ok = 0;
+        p.consec_403 += 1;
+        let old = p.max_inflight;
+        if p.max_inflight > 4 {
+            p.max_inflight = 4;
+        } else if p.max_inflight > 1 {
+            p.max_inflight = 1;
+        }
+        let new_n = p.max_inflight;
+        let pause = if new_n == 1 { 20 } else { 8 };
+        p.pause_until = Instant::now() + Duration::from_secs(pause);
+        if use_proxy {
+            p.proxy_pause = Instant::now() + Duration::from_secs(30);
+        } else {
+            p.direct_pause = Instant::now() + Duration::from_secs(30);
+        }
+        if new_n < old {
+            log(&format!("遇 403，并发从 {old} 路降到 {new_n} 路，暂停 {pause}s"));
+        }
+        if new_n == 1 && !p.refreshing && p.consec_403 >= 2 {
+            p.refreshing = true;
+            p.cooldown_rounds += 1;
+            if p.cooldown_rounds > MAX_COOLDOWNS {
+                if let Ok(mut st) = state.lock() {
+                    st.status = CrawlStatus::Error;
+                    st.status_msg = format!(
+                        "连续冷却 {} 次仍遭 403，判定为持久封禁",
+                        MAX_COOLDOWNS
+                    );
+                }
+                stop.store(true, Ordering::SeqCst);
+                p.refreshing = false;
+                return;
+            }
+            do_refresh = true;
+        }
+        if new_n == 1 && p.consec_403 >= CONSEC_403_THRESHOLD {
+            long_cool = true;
+        }
+        if let Ok(mut st) = state.lock() {
+            st.status = CrawlStatus::Cooling;
+            st.status_msg = format!("{new_n}路（403降速）");
+            st.consecutive_403 = p.consec_403;
+        }
+    }
+    if do_refresh {
+        log("1 路仍 403，刷新 Cookie（Selenium）");
+        let refreshed = try_selenium_cookie_refresh(&log);
+        if refreshed {
+            log("[B] Cookie 已刷新，5 秒后继续");
+            thread::sleep(Duration::from_secs(5));
+        } else if long_cool {
+            log(&format!("[B] 刷新失败，冷却 {:.0}s", COOLDOWN_SEC));
+            let mut remaining = COOLDOWN_SEC;
+            while remaining > 0.0 {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+                remaining -= 1.0;
+                if let Ok(mut st) = state.lock() {
+                    st.cooldown_remaining = remaining;
+                }
+            }
+        } else {
+            thread::sleep(Duration::from_secs(20));
+        }
+        if let Ok(mut p) = pace.lock() {
+            p.refreshing = false;
+            p.consec_403 = 0;
+        }
+        if !stop.load(Ordering::SeqCst) {
+            if let Ok(mut st) = state.lock() {
+                st.cooldown_remaining = 0.0;
+                st.status = CrawlStatus::Running;
+                st.status_msg = "1路（403后）".into();
+            }
+        }
+    }
 }

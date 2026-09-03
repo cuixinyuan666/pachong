@@ -88,6 +88,8 @@ struct NetRuntime {
     desc: String,
     /// 本轮已确认「代理走不通、改直连」后，后续请求都用这个客户端。
     override_client: Option<Client>,
+    /// 双出口并发时关掉：代理失败不要把整场改成直连。
+    direct_fallback: bool,
 }
 
 fn net() -> &'static Mutex<NetRuntime> {
@@ -98,6 +100,7 @@ fn net() -> &'static Mutex<NetRuntime> {
             using_proxy: false,
             desc: String::new(),
             override_client: None,
+            direct_fallback: true,
         })
     })
 }
@@ -128,6 +131,7 @@ pub fn set_proxy_mode(mode: ProxyMode) {
         g.override_client = None;
         g.using_proxy = false;
         g.desc.clear();
+        g.direct_fallback = true;
     }
 }
 
@@ -146,6 +150,99 @@ pub fn last_proxy_desc() -> String {
 
 pub fn session_using_proxy() -> bool {
     net().lock().map(|g| g.using_proxy).unwrap_or(false)
+}
+
+pub fn set_direct_fallback(enable: bool) {
+    if let Ok(mut g) = net().lock() {
+        g.direct_fallback = enable;
+        if enable {
+            g.override_client = None;
+        }
+    }
+}
+
+/// VPN/Clash 系统代理端口还活着时返回地址。
+pub fn live_system_proxy_url() -> Option<String> {
+    let url = detect_proxy_url().filter(|s| !s.is_empty())?;
+    if proxy_tcp_alive(&url) {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+/// 按联网方式准备出口：自动模式且 VPN 代理活着时，代理+直连各一份。
+#[derive(Clone)]
+pub struct ExitClients {
+    pub proxy: Option<Client>,
+    pub direct: Client,
+    pub dual: bool,
+    pub desc: String,
+}
+
+pub fn build_exit_clients(timeout_secs: u64) -> Result<ExitClients, String> {
+    let direct = build_client_with_proxy(timeout_secs, None)?;
+    let mode = current_proxy_mode();
+    let alive_url = live_system_proxy_url();
+
+    let (proxy, dual, desc, using_proxy) = match mode {
+        ProxyMode::Direct => (
+            None,
+            false,
+            "强制直连（16路同一出口）".into(),
+            false,
+        ),
+        ProxyMode::System => match &alive_url {
+            Some(url) => {
+                let c = build_client_with_proxy(timeout_secs, Some(url))?;
+                (
+                    Some(c),
+                    false,
+                    format!("走系统代理 {url}（16路都走 VPN/代理出口）"),
+                    true,
+                )
+            }
+            None => match detect_proxy_url().filter(|s| !s.is_empty()) {
+                Some(url) => (
+                    None,
+                    false,
+                    format!("强制系统代理 {url} 端口连不上，改直连"),
+                    false,
+                ),
+                None => (None, false, "强制系统代理但没读到地址，改直连".into(), false),
+            },
+        },
+        ProxyMode::Auto => match &alive_url {
+            Some(url) => {
+                let c = build_client_with_proxy(timeout_secs, Some(url))?;
+                (
+                    Some(c),
+                    true,
+                    format!("探测到 VPN/系统代理 {url} 可用：一半走代理、一半直连（两个出口）"),
+                    true,
+                )
+            }
+            None => (
+                None,
+                false,
+                "未探测到可用 VPN/系统代理，16路直连".into(),
+                false,
+            ),
+        },
+    };
+
+    if let Ok(mut g) = net().lock() {
+        g.using_proxy = using_proxy;
+        g.desc = desc.clone();
+        g.override_client = None;
+        g.direct_fallback = !dual;
+    }
+    Ok(ExitClients {
+        proxy,
+        direct,
+        dual,
+        desc,
+    })
 }
 
 /// 读环境变量，再读 Windows 系统代理。VPN 关掉后这两处经常还留着 127.0.0.1:端口。
@@ -420,7 +517,10 @@ pub fn send_get_with_fallback(
     match req.send() {
         Ok(r) => Ok(r),
         Err(e) => {
-            if session_using_proxy() && looks_like_transport_error(&e) {
+            if session_using_proxy()
+                && net().lock().map(|g| g.direct_fallback).unwrap_or(true)
+                && looks_like_transport_error(&e)
+            {
                 if let Ok(direct) = build_direct_client(timeout.as_secs().max(20)) {
                     let mut req2 = direct.get(url).timeout(timeout);
                     if let Some(h) = headers {
